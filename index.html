@@ -276,7 +276,7 @@ function Wizard({ resources, onComplete, onCancel }) {
 
           <input style={{ ...input, width: "100%", boxSizing: "border-box", marginBottom: 14 }} placeholder="Luogo / indirizzo" value={luogo} onChange={(e) => setLuogo(e.target.value)} />
 
-          <div style={label2}>Chi mandiamo? (mezzi, radio, personale)</div>
+          <div style={label2}>Attivazione</div>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 16 }}>
             {resources.length === 0 && <span style={{ fontSize: 12, color: "#64748b" }}>Nessuna risorsa inserita — aggiungile nella sezione Risorse.</span>}
             {resources.map((r) => (
