@@ -261,8 +261,14 @@ async function sheetsGet(url, key) {
 async function sheetsGetMany(url, keys) {
   const res = await fetch(`${url}?keys=${encodeURIComponent(keys.join(","))}`, { method: "GET" });
   const data = await res.json().catch(() => ({}));
-  if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
-  return data.values || {};
+  if (res.ok && !data.error && data.values) return { values: data.values, legacy: false };
+  const entries = await Promise.all(keys.map(async (key) => {
+    const legacyRes = await fetch(`${url}?key=${encodeURIComponent(key)}`, { method: "GET" });
+    const legacyData = await legacyRes.json().catch(() => ({}));
+    if (!legacyRes.ok || legacyData.error) throw new Error(legacyData.error || `HTTP ${legacyRes.status}`);
+    return [key, { value: legacyData.value != null ? legacyData.value : null, updated: legacyData.updated || 0 }];
+  }));
+  return { values: Object.fromEntries(entries), legacy: true };
 }
 
 // ================= Wizard attivazione =================
@@ -452,6 +458,7 @@ export default function App() {
   // ha già applicato o inviato: serve al polling per capire se sul foglio c'è qualcosa di più
   // recente arrivato da un ALTRO dispositivo, senza riapplicare in loop i propri stessi dati.
   const remoteTs = useRef({});
+  const localSnapshot = useRef({});
 
   const autoSyncKv = useCallback((key, value) => {
     if (!sheetsUrl) return;
@@ -479,14 +486,17 @@ export default function App() {
         if (currentEventId) {
           keys.push(`resources:${currentEventId}`, `log:${currentEventId}`, `missions:${currentEventId}`);
         }
-        const values = await sheetsGetMany(sheetsUrl, keys);
+        const result = await sheetsGetMany(sheetsUrl, keys);
+        const values = result.values;
+        const legacy = result.legacy;
         if (cancelled) return;
         setConnectionStatus("connected");
         for (const key of keys) {
           const entry = values[key];
           if (!entry || entry.value == null) continue;
-          const seen = remoteTs.current[key] || 0;
-          if (entry.updated > seen) {
+          const snapshot = JSON.stringify(entry.value);
+          if (legacy ? snapshot !== localSnapshot.current[key] : entry.updated > (remoteTs.current[key] || 0)) {
+            localSnapshot.current[key] = snapshot;
             remoteTs.current[key] = entry.updated;
             if (key === "events") setEvents(entry.value);
             else if (key === `resources:${currentEventId}`) setResources(entry.value);
@@ -505,10 +515,11 @@ export default function App() {
     return () => { cancelled = true; clearInterval(id); };
   }, [sheetsUrl, currentEventId]);
 
-  const persistEvents = useCallback(async (next) => { setEvents(next); await saveKey("events", next); autoSyncKv("events", next); }, [autoSyncKv]);
-  const persistResources = useCallback(async (next) => { setResources(next); await saveKey(`resources:${currentEventId}`, next); autoSyncKv(`resources:${currentEventId}`, next); }, [currentEventId, autoSyncKv]);
-  const persistLog = useCallback(async (next) => { setLog(next); await saveKey(`log:${currentEventId}`, next); autoSyncKv(`log:${currentEventId}`, next); }, [currentEventId, autoSyncKv]);
+  const persistEvents = useCallback(async (next) => { localSnapshot.current.events = JSON.stringify(next); setEvents(next); await saveKey("events", next); autoSyncKv("events", next); }, [autoSyncKv]);
+  const persistResources = useCallback(async (next) => { localSnapshot.current[`resources:${currentEventId}`] = JSON.stringify(next); setResources(next); await saveKey(`resources:${currentEventId}`, next); autoSyncKv(`resources:${currentEventId}`, next); }, [currentEventId, autoSyncKv]);
+  const persistLog = useCallback(async (next) => { localSnapshot.current[`log:${currentEventId}`] = JSON.stringify(next); setLog(next); await saveKey(`log:${currentEventId}`, next); autoSyncKv(`log:${currentEventId}`, next); }, [currentEventId, autoSyncKv]);
   const persistMissions = useCallback(async (next) => {
+    localSnapshot.current[`missions:${currentEventId}`] = JSON.stringify(next);
     setMissions(next);
     await saveKey(`missions:${currentEventId}`, next);
     autoSyncKv(`missions:${currentEventId}`, next);
