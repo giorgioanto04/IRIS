@@ -262,12 +262,13 @@ async function sheetsGetMany(url, keys) {
   const res = await fetch(`${url}?keys=${encodeURIComponent(keys.join(","))}`, { method: "GET" });
   const data = await res.json().catch(() => ({}));
   if (res.ok && !data.error && data.values) return { values: data.values, legacy: false };
-  const entries = await Promise.all(keys.map(async (key) => {
+  const entries = [];
+  for (const key of keys) {
     const legacyRes = await fetch(`${url}?key=${encodeURIComponent(key)}`, { method: "GET" });
     const legacyData = await legacyRes.json().catch(() => ({}));
     if (!legacyRes.ok || legacyData.error) throw new Error(legacyData.error || `HTTP ${legacyRes.status}`);
-    return [key, { value: legacyData.value != null ? legacyData.value : null, updated: legacyData.updated || 0 }];
-  }));
+    entries.push([key, { value: legacyData.value != null ? legacyData.value : null, updated: legacyData.updated || 0 }]);
+  }
   return { values: Object.fromEntries(entries), legacy: true };
 }
 
@@ -459,18 +460,38 @@ export default function App() {
   // recente arrivato da un ALTRO dispositivo, senza riapplicare in loop i propri stessi dati.
   const remoteTs = useRef({});
   const localSnapshot = useRef({});
+  const syncQueues = useRef({});
+  const pendingSyncKeys = useRef(new Set());
 
   const autoSyncKv = useCallback((key, value) => {
     if (!sheetsUrl) return;
-    setConnectionStatus("syncing");
-    setSyncStatus("Sincronizzazione…");
-    sheetsPost(sheetsUrl, { action: "kv", key, value })
-      .then((res) => {
-        if (res && res.updated) remoteTs.current[key] = res.updated;
-        setConnectionStatus("connected");
-        setSyncStatus("Sincronizzato con Google Sheet ✓ (" + nowTime() + ")");
-      })
-      .catch((err) => { console.error("Auto-sync Google Sheet:", err); setConnectionStatus("error"); setSyncStatus("Sincronizzazione automatica non riuscita: controlla l'URL in Impostazioni."); });
+    const queue = syncQueues.current[key] || { nextValue: undefined, running: false };
+    queue.nextValue = value;
+    syncQueues.current[key] = queue;
+    pendingSyncKeys.current.add(key);
+    if (queue.running) return;
+    queue.running = true;
+    const flush = async () => {
+      while (queue.nextValue !== undefined) {
+        const nextValue = queue.nextValue;
+        queue.nextValue = undefined;
+        setConnectionStatus("syncing");
+        setSyncStatus("Sincronizzazione…");
+        try {
+          const res = await sheetsPost(sheetsUrl, { action: "kv", key, value: nextValue });
+          if (res && res.updated) remoteTs.current[key] = res.updated;
+          setConnectionStatus("connected");
+          setSyncStatus("Sincronizzato con Google Sheet ✓ (" + nowTime() + ")");
+        } catch (err) {
+          console.error("Auto-sync Google Sheet:", err);
+          setConnectionStatus("error");
+          setSyncStatus("Sincronizzazione automatica non riuscita: controlla l'URL in Impostazioni.");
+        }
+      }
+      queue.running = false;
+      pendingSyncKeys.current.delete(key);
+    };
+    flush();
   }, [sheetsUrl]);
 
   // Polling automatico multi-dispositivo: ogni 1.5s, se è configurato un Google Sheet, chiede al
@@ -480,7 +501,10 @@ export default function App() {
   useEffect(() => {
     if (!sheetsUrl) return;
     let cancelled = false;
+    let pollInFlight = false;
     const poll = async () => {
+      if (pollInFlight) return;
+      pollInFlight = true;
       try {
         const keys = ["events"];
         if (currentEventId) {
@@ -494,6 +518,7 @@ export default function App() {
         for (const key of keys) {
           const entry = values[key];
           if (!entry || entry.value == null) continue;
+          if (pendingSyncKeys.current.has(key)) continue;
           const snapshot = JSON.stringify(entry.value);
           if (legacy ? snapshot !== localSnapshot.current[key] : entry.updated > (remoteTs.current[key] || 0)) {
             localSnapshot.current[key] = snapshot;
@@ -508,6 +533,8 @@ export default function App() {
       } catch (err) {
         console.error("Polling Google Sheet:", err);
         if (!cancelled) setConnectionStatus("error");
+      } finally {
+        pollInFlight = false;
       }
     };
     poll();
