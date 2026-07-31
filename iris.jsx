@@ -436,10 +436,32 @@ export default function App() {
     })();
   }, [currentEventId]);
 
-  const persistEvents = useCallback(async (next) => { setEvents(next); await saveKey("events", next); }, []);
-  const persistResources = useCallback(async (next) => { setResources(next); await saveKey(`resources:${currentEventId}`, next); }, [currentEventId]);
-  const persistLog = useCallback(async (next) => { setLog(next); await saveKey(`log:${currentEventId}`, next); }, [currentEventId]);
-  const persistMissions = useCallback(async (next) => { setMissions(next); await saveKey(`missions:${currentEventId}`, next); }, [currentEventId]);
+  // Sincronizzazione automatica in background: ogni volta che qualcosa viene salvato localmente,
+  // se è configurato un Google Sheet lo si aggiorna subito anche lì, senza bisogno di premere un tasto.
+  // È "fire and forget": non blocca l'interfaccia e non impedisce il salvataggio locale se fallisce.
+  const autoSyncKv = useCallback((key, value) => {
+    if (!sheetsUrl) return;
+    setSyncStatus("Sincronizzazione…");
+    sheetsPost(sheetsUrl, { action: "kv", key, value })
+      .then(() => setSyncStatus("Sincronizzato con Google Sheet ✓ (" + nowTime() + ")"))
+      .catch((err) => { console.error("Auto-sync Google Sheet:", err); setSyncStatus("Sincronizzazione automatica non riuscita: controlla l'URL in Impostazioni."); });
+  }, [sheetsUrl]);
+
+  const persistEvents = useCallback(async (next) => { setEvents(next); await saveKey("events", next); autoSyncKv("events", next); }, [autoSyncKv]);
+  const persistResources = useCallback(async (next) => { setResources(next); await saveKey(`resources:${currentEventId}`, next); autoSyncKv(`resources:${currentEventId}`, next); }, [currentEventId, autoSyncKv]);
+  const persistLog = useCallback(async (next) => { setLog(next); await saveKey(`log:${currentEventId}`, next); autoSyncKv(`log:${currentEventId}`, next); }, [currentEventId, autoSyncKv]);
+  const persistMissions = useCallback(async (next) => {
+    setMissions(next);
+    await saveKey(`missions:${currentEventId}`, next);
+    autoSyncKv(`missions:${currentEventId}`, next);
+    // Ogni missione modificata viene scritta anche nella scheda "Missioni" (riga leggibile per paziente),
+    // così il foglio resta sempre allineato senza dover premere "Salva su Google Sheet" a parte.
+    if (sheetsUrl) {
+      next.forEach((m) => {
+        sheetsPost(sheetsUrl, { action: "saveMission", mission: m }).catch((err) => console.error("Auto-sync missione:", err));
+      });
+    }
+  }, [currentEventId, autoSyncKv, sheetsUrl]);
 
   const currentEvent = events.find((e) => e.id === currentEventId);
 
