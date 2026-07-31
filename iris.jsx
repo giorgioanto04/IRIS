@@ -12,6 +12,30 @@ const COLORI = {
 };
 const TIPI_RISORSA = ["Ambulanza", "Radio", "Personale"];
 
+// Stati rapidi del mezzo/risorsa, mostrati nella barra laterale.
+// "campo" indica quale orario della scheda missione viene aggiornato quando si seleziona lo stato.
+const STATI_MEZZO = [
+  { id: "operativo", label: "Operativo", short: "OPER.", color: "#16a34a", campo: null },
+  { id: "diretto_intervento", label: "Diretto intervento", short: "DIR. INT.", color: "#eab308", campo: "oraAttivazione" },
+  { id: "sul_intervento", label: "Sull'intervento", short: "S. INT.", color: "#f97316", campo: "oraSulPosto" },
+  { id: "diretto_ospedale", label: "Diretto ospedale", short: "DIR. OSP.", color: "#dc2626", campo: "oraTrasporto" },
+  { id: "in_ospedale", label: "In ospedale", short: "OSPEDALE", color: "#a855f7", campo: "oraOspedale" },
+  { id: "libero_rientro", label: "Libero in rientro", short: "RIENTRO", color: "#38bdf8", campo: "oraRitorno" },
+];
+const STATO_ALTRO = { id: "altro", label: "Altro", short: "ALTRO", color: "#64748b", campo: null };
+
+// Trova, tra le missioni dell'evento, la più recente a cui la risorsa risulta assegnata e
+// non ancora conclusa: è quella su cui riportare gli orari quando cambia lo stato del mezzo.
+function findActiveMissionForResource(missions, log, resourceId) {
+  for (const m of missions) {
+    if (m.risorse && m.risorse.some((r) => r.resourceId === resourceId)) {
+      const le = log.find((l) => l.missionId === m.id);
+      if (!le || le.stato !== "conclusa") return m;
+    }
+  }
+  return null;
+}
+
 const EVENTO_TIPI = [
   "Perdita di coscienza", "Convulsioni", "Malessere", "Caduta", "Incidente stradale",
   "Avvelenamento", "Evento violento", "Infortunio", "Travaglio/parto", "Malore", "Altro",
@@ -52,7 +76,7 @@ function emptyPaziente() {
   };
 }
 function emptyRisorsaMissione(r) {
-  return { resourceId: r.id, nome: r.nome, tipo: r.tipo, oraAttivazione: nowTime(), oraSulPosto: "", oraTrasporto: "", oraRitorno: "" };
+  return { resourceId: r.id, nome: r.nome, tipo: r.tipo, oraAttivazione: nowTime(), oraSulPosto: "", oraTrasporto: "", oraOspedale: "", oraRitorno: "" };
 }
 
 // ================= Triage =================
@@ -298,14 +322,45 @@ export default function App() {
     return formatMissionNumber(currentEvent?.date, seq);
   }, [missionSeq, currentEventId, currentEvent]);
 
+  // Cambia rapidamente lo stato di una risorsa (dalla barra laterale): registra l'orario,
+  // crea una riga nel brogliaccio e, se la risorsa è assegnata a una missione ancora aperta,
+  // aggiorna anche l'orario corrispondente nella scheda missione.
+  const setResourceStato = async (resourceId, statoId, customLabel) => {
+    const r = resources.find((x) => x.id === resourceId);
+    if (!r) return;
+    const ora = nowTime();
+    const def = statoId === "altro" ? STATO_ALTRO : STATI_MEZZO.find((s) => s.id === statoId);
+    if (!def) return;
+    const statoLabel = statoId === "altro" ? (customLabel || "Altro") : def.label;
+
+    const nextResources = resources.map((x) => (x.id === resourceId ? { ...x, stato: statoId, statoLabel, statoOra: ora } : x));
+    await persistResources(nextResources);
+
+    const logEntry = { id: uid(), ora, mezzo: r.nome, luogo: "", tipoEvento: `Cambio stato: ${statoLabel}`, note: "", stato: "conclusa", missionId: null, numero: null, codiceInvio: "", creato: Date.now() };
+    await persistLog([logEntry, ...log]);
+
+    if (def.campo) {
+      const activeMission = findActiveMissionForResource(missions, log, resourceId);
+      if (activeMission) {
+        const nextMissions = missions.map((m) => (m.id !== activeMission.id ? m : { ...m, risorse: m.risorse.map((rr) => (rr.resourceId === resourceId ? { ...rr, [def.campo]: ora } : rr)) }));
+        await persistMissions(nextMissions);
+      }
+    }
+  };
+
   const handleWizardComplete = async ({ answers, luogo, motivo, codiceInvio, risorseIds }) => {
     try {
       const numero = await nextMissionNumber();
+      const ora = nowTime();
       const risorse = risorseIds.map((id) => resources.find((r) => r.id === id)).filter(Boolean).map(emptyRisorsaMissione);
-      const mission = { id: uid(), numero, ora: nowTime(), luogo, motivo, codiceInvio, risorse, pazienti: [emptyPaziente()] };
-      const logEntry = { id: uid(), ora: mission.ora, mezzo: risorse.map((r) => r.nome).join(", "), luogo, tipoEvento: motivo || "Attivazione", note: "", stato: "in corso", missionId: mission.id, numero, codiceInvio, wizardAnswers: answers, creato: Date.now() };
+      const mission = { id: uid(), numero, ora, luogo, motivo, codiceInvio, risorse, pazienti: [emptyPaziente()] };
+      const logEntry = { id: uid(), ora, mezzo: risorse.map((r) => r.nome).join(", "), luogo, tipoEvento: motivo || "Attivazione", note: "", stato: "in corso", missionId: mission.id, numero, codiceInvio, wizardAnswers: answers, creato: Date.now() };
+      // Le risorse inviate su un'attivazione passano automaticamente allo stato "Diretto intervento",
+      // così la barra laterale resta allineata con la scheda missione appena creata.
+      const nextResources = resources.map((r) => (risorseIds.includes(r.id) ? { ...r, stato: "diretto_intervento", statoLabel: "Diretto intervento", statoOra: ora } : r));
       await persistMissions([mission, ...missions]);
       await persistLog([logEntry, ...log]);
+      await persistResources(nextResources);
       setWizardOpen(false); setTab("missioni"); setOpenMissionId(mission.id);
     } catch (err) {
       console.error("Errore creazione missione:", err);
@@ -326,16 +381,28 @@ export default function App() {
 
   return (
     <div style={{ minHeight: "100vh", background: "#0b1220", color: "#e2e8f0", fontFamily: "'Inter', system-ui, sans-serif" }}>
+      <style>{`
+        .iris-body { display: flex; align-items: flex-start; max-width: 1400px; margin: 0 auto; }
+        .iris-sidebar { width: 240px; flex-shrink: 0; box-sizing: border-box; padding: 14px 10px; position: sticky; top: 62px; max-height: calc(100vh - 62px); overflow-y: auto; border-right: 1px solid #1e293b; }
+        .iris-main { flex: 1; min-width: 0; box-sizing: border-box; padding: 16px 16px 60px; }
+        @media (max-width: 860px) {
+          .iris-body { flex-direction: column; }
+          .iris-sidebar { width: 100%; position: static; max-height: none; border-right: none; border-bottom: 1px solid #1e293b; }
+        }
+      `}</style>
       <TopBar currentEvent={currentEvent} tab={tab} setTab={setTab} onNuovaSerata={() => setCurrentEventId(null)} inEvent={!!currentEventId} />
       {!currentEventId ? (
         <EventoSetup events={events} onCreate={persistEvents} onSelect={setCurrentEventId} onDelete={persistEvents} />
       ) : (
-        <div style={{ maxWidth: 1100, margin: "0 auto", padding: "16px 16px 60px" }}>
-          {tab === "risorse" && <Risorse resources={resources} onChange={persistResources} />}
-          {tab === "attivazioni" && !wizardOpen && <Attivazioni log={log} onNuova={() => setWizardOpen(true)} onApriScheda={apriSchedaDaLog} />}
-          {tab === "attivazioni" && wizardOpen && <Wizard resources={resources} onCancel={() => setWizardOpen(false)} onComplete={handleWizardComplete} />}
-          {tab === "brogliaccio" && <Brogliaccio log={log} onChange={persistLog} resources={resources} onApriScheda={apriSchedaDaLog} />}
-          {tab === "missioni" && <Missioni missions={missions} resources={resources} onChange={persistMissions} openId={openMissionId} setOpenId={setOpenMissionId} />}
+        <div className="iris-body">
+          <ResourceStatusBar resources={resources} onSetStato={setResourceStato} />
+          <div className="iris-main">
+            {tab === "risorse" && <Risorse resources={resources} onChange={persistResources} />}
+            {tab === "attivazioni" && !wizardOpen && <Attivazioni log={log} onNuova={() => setWizardOpen(true)} onApriScheda={apriSchedaDaLog} />}
+            {tab === "attivazioni" && wizardOpen && <Wizard resources={resources} onCancel={() => setWizardOpen(false)} onComplete={handleWizardComplete} />}
+            {tab === "brogliaccio" && <Brogliaccio log={log} onChange={persistLog} resources={resources} onApriScheda={apriSchedaDaLog} />}
+            {tab === "missioni" && <Missioni missions={missions} resources={resources} onChange={persistMissions} openId={openMissionId} setOpenId={setOpenMissionId} />}
+          </div>
         </div>
       )}
     </div>
@@ -369,6 +436,79 @@ function TopBar({ currentEvent, tab, setTab, onNuovaSerata, inEvent }) {
             <ChevronDown size={14} style={{ position: "absolute", right: 9, top: 10, pointerEvents: "none", color: "#64748b" }} />
           </div>
           <button onClick={onNuovaSerata} style={btnGhost}>Nuova serata</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ================= Barra laterale stato risorse =================
+function ResourceStatusBar({ resources, onSetStato }) {
+  return (
+    <div className="iris-sidebar">
+      <div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: 1, color: "#64748b", marginBottom: 10, padding: "0 4px", fontWeight: 700 }}>
+        Stato risorse
+      </div>
+      {resources.length === 0 && (
+        <div style={{ fontSize: 12, color: "#64748b", padding: "0 4px" }}>Nessuna risorsa inserita. Aggiungile nella sezione Risorse.</div>
+      )}
+      {resources.map((r) => (
+        <ResourceStatusCard key={r.id} resource={r} onSetStato={(statoId, custom) => onSetStato(r.id, statoId, custom)} />
+      ))}
+    </div>
+  );
+}
+
+function ResourceStatusCard({ resource, onSetStato }) {
+  const [customOpen, setCustomOpen] = useState(false);
+  const [customText, setCustomText] = useState("");
+  const current = resource.stato || "operativo";
+  const def = current === "altro" ? STATO_ALTRO : STATI_MEZZO.find((s) => s.id === current);
+  const badgeColor = def ? def.color : "#94a3b8";
+  const badgeLabel = current === "altro" ? (resource.statoLabel || "Altro") : (def ? def.label : "—");
+
+  const scegli = (statoId) => { setCustomOpen(false); onSetStato(statoId); };
+  const confermaCustom = () => {
+    if (!customText.trim()) return;
+    onSetStato("altro", customText.trim());
+    setCustomText(""); setCustomOpen(false);
+  };
+
+  return (
+    <div style={{ background: "#111827", border: "1px solid #1e293b", borderRadius: 8, padding: "8px 10px", marginBottom: 8 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 3 }}>
+        <span style={{ width: 8, height: 8, borderRadius: "50%", background: badgeColor, flexShrink: 0, boxShadow: `0 0 6px ${badgeColor}` }} />
+        <span style={{ fontWeight: 700, fontSize: 12.5, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{resource.nome}</span>
+      </div>
+      <div style={{ fontSize: 10.5, color: "#64748b", marginBottom: 7 }}>{badgeLabel}{resource.statoOra ? ` · ${resource.statoOra}` : ""}</div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+        {STATI_MEZZO.map((s) => (
+          <button
+            key={s.id}
+            onClick={() => scegli(s.id)}
+            style={{ ...miniBtn, ...(current === s.id ? { background: s.color, color: "#0b1220", borderColor: s.color } : { borderColor: s.color, color: s.color }) }}
+          >
+            {s.short}
+          </button>
+        ))}
+        <button
+          onClick={() => setCustomOpen((o) => !o)}
+          style={{ ...miniBtn, ...(current === "altro" ? { background: STATO_ALTRO.color, color: "#0b1220", borderColor: STATO_ALTRO.color } : { borderColor: STATO_ALTRO.color, color: STATO_ALTRO.color }) }}
+        >
+          {STATO_ALTRO.short}
+        </button>
+      </div>
+      {customOpen && (
+        <div style={{ display: "flex", gap: 4, marginTop: 6 }}>
+          <input
+            style={{ ...input, flex: 1, fontSize: 11, padding: "5px 6px" }}
+            placeholder="Stato personalizzato…"
+            value={customText}
+            onChange={(e) => setCustomText(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") confermaCustom(); }}
+            autoFocus
+          />
+          <button style={{ ...btnGhost, padding: "5px 8px" }} onClick={confermaCustom}>OK</button>
         </div>
       )}
     </div>
