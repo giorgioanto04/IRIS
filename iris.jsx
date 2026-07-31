@@ -152,6 +152,65 @@ function suggerisciColoreTrasporto(p) {
   return null;
 }
 
+// ================= Esportazione CSV =================
+function csvEscape(v) {
+  const s = v === null || v === undefined ? "" : String(v);
+  return /[;"\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+function downloadCsv(filename, rows) {
+  const csv = rows.map((r) => r.map(csvEscape).join(";")).join("\n");
+  const blob = new Blob(["\ufeff" + csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a"); a.href = url; a.download = filename; a.click(); URL.revokeObjectURL(url);
+}
+// Brogliaccio: mezzo, ora, cosa (evento) e, se presente, il numero missione collegato.
+function exportBrogliaccioCsv(log) {
+  const headers = ["Ora", "N. missione", "Mezzo", "Cosa", "Luogo", "Codice invio", "Stato", "Note"];
+  const rows = [headers, ...log.map((l) => [
+    l.ora, l.numero || "", l.mezzo || "", l.tipoEvento || "", l.luogo || "",
+    l.codiceInvio ? COLORI[l.codiceInvio].label : "", l.stato || "", l.note || "",
+  ])];
+  downloadCsv("brogliaccio.csv", rows);
+}
+// Schede missione: dati dell'attivazione + una riga per ciascun paziente con tutti i campi della scheda.
+function exportMissioniCsv(missions) {
+  const headers = [
+    "N. missione", "Ora attivazione", "Luogo", "Codice invio", "Motivo", "Mezzi assegnati",
+    "Paziente", "Cognome", "Nome", "Sesso", "Età",
+    "Evento", "Luogo evento", "Coscienza", "Respiro", "Circolo", "Cute",
+    "FR", "SAT aria", "SAT O2", "FC", "PA", "Temp", "Glicemia",
+    "Lesioni", "CPSS", "ACC",
+    "Rifiuta trasporto", "Ora rifiuto trasporto", "Rifiuta presidi", "Ora rifiuto presidi",
+    "Codice trasporto", "Destinazione", "Ora accettazione", "Note",
+  ];
+  const rows = [headers];
+  missions.forEach((m) => {
+    const mezzi = (m.risorse || []).map((r) => r.nome).join(", ");
+    (m.pazienti || []).forEach((p, i) => {
+      const circolo = [p.circolo?.tipo, p.circolo?.ritmo, p.circolo?.assente ? "Assente" : ""].filter(Boolean).join(" ");
+      const cute = [p.cute?.temp, p.cute?.colore, p.cute?.sudata ? "Sudata" : ""].filter(Boolean).join(" ");
+      const lesioni = (p.lesioni || []).map((l) => `${l.tipo}${l.zona ? " (" + l.zona + ")" : ""}${l.scala ? " NRS " + l.scala : ""}`).join(" | ");
+      const accAttivo = p.acc && (p.acc.rcpInCorso || p.acc.accDuranteTrasporto || p.acc.esito);
+      const accEsitoLabel = { trasporto_rcp: "Trasporto con RCP", deceduto: "Deceduto", rosc: "ROSC" }[p.acc?.esito] || "";
+      const acc = accAttivo ? [accEsitoLabel, p.acc.rcpInCorso ? "RCP in corso" : "", p.acc.accDuranteTrasporto ? "ACC in trasporto" : "", p.acc.roscOre ? `ROSC ${p.acc.roscOre}` : ""].filter(Boolean).join(" · ") : "";
+      const codTrasp = p.rifiutaTrasporto ? "" : (p.codiceTrasporto || suggerisciColoreTrasporto(p) || "");
+      rows.push([
+        m.numero, m.ora, m.luogo, m.codiceInvio ? COLORI[m.codiceInvio].label : "", m.motivo || "", mezzi,
+        `P${i + 1}`, p.cognome, p.nome, p.sesso, p.eta,
+        [...(p.eventoTipi || []), p.eventoAltro].filter(Boolean).join(", "),
+        p.luogoEvento === "Altro" ? p.luogoEventoAltro : p.luogoEvento,
+        p.coscienza, p.respiro, circolo, cute,
+        p.fr, p.satAria, p.satO2, p.fc, p.pa, p.temp, p.glicemia,
+        lesioni, (p.cpss || []).join(", "), acc,
+        p.rifiutaTrasporto ? "SI" : "NO", p.oraRifiutoTrasporto || "",
+        p.rifiutaPresidi ? "SI" : "NO", p.oraRifiutoPresidi || "",
+        codTrasp ? COLORI[codTrasp].label : "", p.destinazioneAzienda, p.oraAccettazione, p.note,
+      ]);
+    });
+  });
+  downloadCsv("schede_missione.csv", rows);
+}
+
 // ================= Storage helpers =================
 // Dentro Claude usa window.storage; se pubblicata online (es. GitHub Pages) usa il localStorage del browser.
 async function loadKey(key, fallback) {
@@ -395,7 +454,7 @@ export default function App() {
         <EventoSetup events={events} onCreate={persistEvents} onSelect={setCurrentEventId} onDelete={persistEvents} />
       ) : (
         <div className="iris-body">
-          <ResourceStatusBar resources={resources} onSetStato={setResourceStato} />
+          <ResourceStatusBar resources={resources} onSetStato={setResourceStato} onExportBrogliaccio={() => exportBrogliaccioCsv(log)} onExportMissioni={() => exportMissioniCsv(missions)} />
           <div className="iris-main">
             {tab === "risorse" && <Risorse resources={resources} onChange={persistResources} />}
             {tab === "attivazioni" && !wizardOpen && <Attivazioni log={log} onNuova={() => setWizardOpen(true)} onApriScheda={apriSchedaDaLog} />}
@@ -443,18 +502,27 @@ function TopBar({ currentEvent, tab, setTab, onNuovaSerata, inEvent }) {
 }
 
 // ================= Barra laterale stato risorse =================
-function ResourceStatusBar({ resources, onSetStato }) {
+const TIPO_ICON = { Ambulanza: Ambulance, Radio: Radio, Personale: Users };
+const sidebarTitle = { fontSize: 11, textTransform: "uppercase", letterSpacing: 1, color: "#64748b", marginBottom: 10, padding: "0 4px", fontWeight: 700 };
+
+function ResourceStatusBar({ resources, onSetStato, onExportBrogliaccio, onExportMissioni }) {
   return (
     <div className="iris-sidebar">
-      <div style={{ fontSize: 11, textTransform: "uppercase", letterSpacing: 1, color: "#64748b", marginBottom: 10, padding: "0 4px", fontWeight: 700 }}>
-        Stato risorse
-      </div>
+      <div style={sidebarTitle}>Stato risorse</div>
       {resources.length === 0 && (
-        <div style={{ fontSize: 12, color: "#64748b", padding: "0 4px" }}>Nessuna risorsa inserita. Aggiungile nella sezione Risorse.</div>
+        <div style={{ fontSize: 12, color: "#64748b", padding: "0 4px 10px" }}>Nessuna risorsa inserita. Aggiungile nella sezione Risorse.</div>
       )}
       {resources.map((r) => (
         <ResourceStatusCard key={r.id} resource={r} onSetStato={(statoId, custom) => onSetStato(r.id, statoId, custom)} />
       ))}
+
+      <div style={{ ...sidebarTitle, marginTop: 20 }}>Esporta dati</div>
+      <button style={{ ...btnSecondary, width: "100%", justifyContent: "center", marginBottom: 8, boxSizing: "border-box" }} onClick={onExportBrogliaccio}>
+        <Download size={13} /> Brogliaccio (CSV)
+      </button>
+      <button style={{ ...btnSecondary, width: "100%", justifyContent: "center", boxSizing: "border-box" }} onClick={onExportMissioni}>
+        <Download size={13} /> Schede missione (CSV)
+      </button>
     </div>
   );
 }
@@ -463,11 +531,16 @@ function ResourceStatusCard({ resource, onSetStato }) {
   const [customOpen, setCustomOpen] = useState(false);
   const [customText, setCustomText] = useState("");
   const current = resource.stato || "operativo";
-  const def = current === "altro" ? STATO_ALTRO : STATI_MEZZO.find((s) => s.id === current);
-  const badgeColor = def ? def.color : "#94a3b8";
-  const badgeLabel = current === "altro" ? (resource.statoLabel || "Altro") : (def ? def.label : "—");
+  const def = current === "altro" ? STATO_ALTRO : (STATI_MEZZO.find((s) => s.id === current) || STATI_MEZZO[0]);
+  const badgeLabel = current === "altro" ? (resource.statoLabel || "Altro") : def.label;
+  const Icon = TIPO_ICON[resource.tipo] || Ambulance;
 
-  const scegli = (statoId) => { setCustomOpen(false); onSetStato(statoId); };
+  const handleSelect = (e) => {
+    const val = e.target.value;
+    if (val === "altro") { setCustomOpen(true); return; }
+    setCustomOpen(false);
+    onSetStato(val);
+  };
   const confermaCustom = () => {
     if (!customText.trim()) return;
     onSetStato("altro", customText.trim());
@@ -475,31 +548,29 @@ function ResourceStatusCard({ resource, onSetStato }) {
   };
 
   return (
-    <div style={{ background: "#111827", border: "1px solid #1e293b", borderRadius: 8, padding: "8px 10px", marginBottom: 8 }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 3 }}>
-        <span style={{ width: 8, height: 8, borderRadius: "50%", background: badgeColor, flexShrink: 0, boxShadow: `0 0 6px ${badgeColor}` }} />
-        <span style={{ fontWeight: 700, fontSize: 12.5, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{resource.nome}</span>
+    <div style={{ background: "#111827", border: "1px solid #1e293b", borderRadius: 8, padding: "10px 12px", marginBottom: 8 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 8 }}>
+        <Icon size={13} color="#64748b" style={{ flexShrink: 0 }} />
+        <span style={{ fontWeight: 700, fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>{resource.nome}</span>
+        <span style={{ width: 8, height: 8, borderRadius: "50%", background: def.color, flexShrink: 0, boxShadow: `0 0 6px ${def.color}` }} />
       </div>
-      <div style={{ fontSize: 10.5, color: "#64748b", marginBottom: 7 }}>{badgeLabel}{resource.statoOra ? ` · ${resource.statoOra}` : ""}</div>
-      <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
-        {STATI_MEZZO.map((s) => (
-          <button
-            key={s.id}
-            onClick={() => scegli(s.id)}
-            style={{ ...miniBtn, ...(current === s.id ? { background: s.color, color: "#0b1220", borderColor: s.color } : { borderColor: s.color, color: s.color }) }}
-          >
-            {s.short}
-          </button>
-        ))}
-        <button
-          onClick={() => setCustomOpen((o) => !o)}
-          style={{ ...miniBtn, ...(current === "altro" ? { background: STATO_ALTRO.color, color: "#0b1220", borderColor: STATO_ALTRO.color } : { borderColor: STATO_ALTRO.color, color: STATO_ALTRO.color }) }}
+
+      <div style={{ position: "relative" }}>
+        <select
+          value={current === "altro" ? "altro" : current}
+          onChange={handleSelect}
+          style={{ ...input, width: "100%", boxSizing: "border-box", appearance: "none", fontSize: 12, fontWeight: 700, color: def.color, borderColor: def.color, paddingRight: 26, cursor: "pointer" }}
         >
-          {STATO_ALTRO.short}
-        </button>
+          {STATI_MEZZO.map((s) => <option key={s.id} value={s.id}>{s.label}</option>)}
+          <option value="altro">Altro…</option>
+        </select>
+        <ChevronDown size={13} style={{ position: "absolute", right: 8, top: 9, pointerEvents: "none", color: def.color }} />
       </div>
+
+      <div style={{ fontSize: 10.5, color: "#64748b", marginTop: 6 }}>{badgeLabel}{resource.statoOra ? ` · aggiornato ${resource.statoOra}` : ""}</div>
+
       {customOpen && (
-        <div style={{ display: "flex", gap: 4, marginTop: 6 }}>
+        <div style={{ display: "flex", gap: 4, marginTop: 8 }}>
           <input
             style={{ ...input, flex: 1, fontSize: 11, padding: "5px 6px" }}
             placeholder="Stato personalizzato…"
@@ -674,24 +745,7 @@ function Missioni({ missions, resources, onChange, openId, setOpenId }) {
   const removePaziente = (missionId, patientId) => onChange(missions.map((m) => (m.id !== missionId ? m : { ...m, pazienti: m.pazienti.filter((p) => p.id !== patientId) })));
   const remove = (id) => { onChange(missions.filter((m) => m.id !== id)); if (openId === id) setOpenId(null); };
 
-  const exportCsv = () => {
-    const headers = ["numero", "ora", "luogo", "cognome", "nome", "eta", "coscienza", "respiro", "codiceInvio", "codiceTrasporto", "rifiutaTrasporto", "oraRifiutoTrasporto", "rifiutaPresidi", "oraRifiutoPresidi", "note"];
-    const rows = [];
-    missions.forEach((m) => m.pazienti.forEach((p) => {
-      rows.push(headers.map((h) => {
-        if (h === "numero") return m.numero;
-        if (h === "ora") return m.ora;
-        if (h === "luogo") return m.luogo;
-        if (h === "codiceInvio") return m.codiceInvio || "";
-        if (h === "codiceTrasporto") return p.codiceTrasporto || suggerisciColoreTrasporto(p) || "";
-        return p[h] ?? "";
-      }).join(";"));
-    }));
-    const csv = [headers.join(";"), ...rows].join("\n");
-    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a"); a.href = url; a.download = "schede_missione.csv"; a.click(); URL.revokeObjectURL(url);
-  };
+  const exportCsv = () => exportMissioniCsv(missions);
 
   if (open) {
     return (
@@ -1023,5 +1077,4 @@ const btnPrimary = { display: "flex", alignItems: "center", gap: 6, background: 
 const btnSecondary = { display: "flex", alignItems: "center", gap: 6, background: "transparent", color: "#38bdf8", border: "1px solid #38bdf8", borderRadius: 6, padding: "6px 12px", fontWeight: 600, fontSize: 12, cursor: "pointer" };
 const btnGhost = { display: "flex", alignItems: "center", gap: 6, background: "transparent", color: "#94a3b8", border: "none", borderRadius: 6, padding: "6px 10px", fontWeight: 600, fontSize: 12, cursor: "pointer" };
 const toggleBtn = { background: "#0f172a", border: "1px solid #1e293b", color: "#94a3b8", borderRadius: 6, padding: "7px 12px", fontSize: 12, fontWeight: 600, cursor: "pointer" };
-const miniBtn = { background: "transparent", border: "1px solid #1e293b", borderRadius: 5, padding: "4px 6px", fontSize: 9.5, fontWeight: 800, cursor: "pointer", letterSpacing: 0.3, whiteSpace: "nowrap" };
 const activeToggle = { background: "#0c4a6e", color: "#7dd3fc", borderColor: "#38bdf8" };
