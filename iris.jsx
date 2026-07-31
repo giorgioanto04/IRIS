@@ -16,7 +16,7 @@ const TIPI_RISORSA = ["Ambulanza", "Radio", "Personale"];
 // "campo" indica quale orario della scheda missione viene aggiornato quando si seleziona lo stato.
 const STATI_MEZZO = [
   { id: "operativo", label: "Operativo", short: "OPER.", color: "#16a34a", campo: null },
-  { id: "diretto_intervento", label: "Diretto intervento", short: "DIR. INT.", color: "#eab308", campo: "oraAttivazione" },
+  { id: "diretto_intervento", label: "Diretto intervento", short: "DIR. INT.", color: "#eab308", campo: "oraPartenza" },
   { id: "sul_intervento", label: "Sull'intervento", short: "S. INT.", color: "#f97316", campo: "oraSulPosto" },
   { id: "diretto_ospedale", label: "Diretto ospedale", short: "DIR. OSP.", color: "#dc2626", campo: "oraTrasporto" },
   { id: "in_ospedale", label: "In ospedale", short: "OSPEDALE", color: "#a855f7", campo: "oraOspedale" },
@@ -24,14 +24,13 @@ const STATI_MEZZO = [
 ];
 const STATO_ALTRO = { id: "altro", label: "Altro", short: "ALTRO", color: "#64748b", campo: null };
 
-// Trova, tra le missioni dell'evento, la più recente a cui la risorsa risulta assegnata e
-// non ancora conclusa: è quella su cui riportare gli orari quando cambia lo stato del mezzo.
-function findActiveMissionForResource(missions, log, resourceId) {
+// Trova, tra le missioni dell'evento, la più recente a cui la risorsa risulta assegnata (le missioni
+// sono ordinate dalla più recente): è quella su cui riportare gli orari quando cambia lo stato del mezzo.
+// Non dipende dallo stato "conclusa"/"in corso" della riga di attivazione, altrimenti un secondo mezzo
+// agganciato alla stessa missione smetterebbe di ricevere gli orari non appena la richiesta viene chiusa.
+function findActiveMissionForResource(missions, resourceId) {
   for (const m of missions) {
-    if (m.risorse && m.risorse.some((r) => r.resourceId === resourceId)) {
-      const le = log.find((l) => l.missionId === m.id);
-      if (!le || le.stato !== "conclusa") return m;
-    }
+    if (m.risorse && m.risorse.some((r) => r.resourceId === resourceId)) return m;
   }
   return null;
 }
@@ -63,7 +62,7 @@ function formatMissionNumber(eventDateStr, seq) {
 
 function emptyPaziente() {
   return {
-    id: uid(), cognome: "", nome: "", sesso: "", eta: "",
+    id: uid(), cognome: "", nome: "", sesso: "", eta: "", codiceFiscale: "",
     eventoTipi: [], eventoAltro: "", luogoEvento: "", luogoEventoAltro: "",
     coscienza: "", respiro: "",
     circolo: { tipo: "", ritmo: "", assente: false },
@@ -76,7 +75,7 @@ function emptyPaziente() {
   };
 }
 function emptyRisorsaMissione(r) {
-  return { resourceId: r.id, nome: r.nome, tipo: r.tipo, oraAttivazione: nowTime(), oraSulPosto: "", oraTrasporto: "", oraOspedale: "", oraRitorno: "" };
+  return { resourceId: r.id, nome: r.nome, tipo: r.tipo, oraAttivazione: nowTime(), oraPartenza: "", oraSulPosto: "", oraTrasporto: "", oraOspedale: "", oraRitorno: "" };
 }
 
 // ================= Triage =================
@@ -176,7 +175,7 @@ function exportBrogliaccioCsv(log) {
 function exportMissioniCsv(missions) {
   const headers = [
     "N. missione", "Ora attivazione", "Luogo", "Codice invio", "Motivo", "Mezzi assegnati",
-    "Paziente", "Cognome", "Nome", "Sesso", "Età",
+    "Paziente", "Cognome", "Nome", "Sesso", "Età", "Codice fiscale",
     "Evento", "Luogo evento", "Coscienza", "Respiro", "Circolo", "Cute",
     "FR", "SAT aria", "SAT O2", "FC", "PA", "Temp", "Glicemia",
     "Lesioni", "CPSS", "ACC",
@@ -196,7 +195,7 @@ function exportMissioniCsv(missions) {
       const codTrasp = p.rifiutaTrasporto ? "" : (p.codiceTrasporto || suggerisciColoreTrasporto(p) || "");
       rows.push([
         m.numero, m.ora, m.luogo, m.codiceInvio ? COLORI[m.codiceInvio].label : "", m.motivo || "", mezzi,
-        `P${i + 1}`, p.cognome, p.nome, p.sesso, p.eta,
+        `P${i + 1}`, p.cognome, p.nome, p.sesso, p.eta, p.codiceFiscale,
         [...(p.eventoTipi || []), p.eventoAltro].filter(Boolean).join(", "),
         p.luogoEvento === "Altro" ? p.luogoEventoAltro : p.luogoEvento,
         p.coscienza, p.respiro, circolo, cute,
@@ -395,21 +394,28 @@ export default function App() {
     const nextResources = resources.map((x) => (x.id === resourceId ? { ...x, stato: statoId, statoLabel, statoOra: ora } : x));
     await persistResources(nextResources);
 
-    const logEntry = { id: uid(), ora, mezzo: r.nome, luogo: "", tipoEvento: `Cambio stato: ${statoLabel}`, note: "", stato: "conclusa", missionId: null, numero: null, codiceInvio: "", creato: Date.now() };
-
-    let activeMission = null;
-    if (def.campo) {
-      activeMission = findActiveMissionForResource(missions, log, resourceId);
-      if (activeMission) {
-        const nextMissions = missions.map((m) => (m.id !== activeMission.id ? m : { ...m, risorse: m.risorse.map((rr) => (rr.resourceId === resourceId ? { ...rr, [def.campo]: ora } : rr)) }));
-        await persistMissions(nextMissions);
-      }
+    // Missione a cui la risorsa è agganciata (anche se assegnata in un secondo momento, dopo l'attivazione).
+    const activeMission = findActiveMissionForResource(missions, resourceId);
+    if (activeMission && def.campo) {
+      const nextMissions = missions.map((m) => (m.id !== activeMission.id ? m : { ...m, risorse: m.risorse.map((rr) => (rr.resourceId === resourceId ? { ...rr, [def.campo]: ora } : rr)) }));
+      await persistMissions(nextMissions);
     }
+
+    // La riga del brogliaccio riporta anche il numero missione, se il mezzo è agganciato a una missione.
+    // È "in corso" per qualsiasi stato diverso da "Operativo" (il mezzo è comunque impegnato), "conclusa"
+    // solo quando torna libero.
+    const logEntry = {
+      id: uid(), ora, mezzo: r.nome, luogo: "", tipoEvento: `Cambio stato: ${statoLabel}`, note: "",
+      stato: statoId === "operativo" ? "conclusa" : "in corso",
+      missionId: activeMission ? activeMission.id : null,
+      numero: activeMission ? activeMission.numero : null,
+      codiceInvio: "", creato: Date.now(), auto: true,
+    };
 
     // Arrivo in ospedale = trasporto concluso: la richiesta esce dalla lista Attivazioni
     // (resta comunque visibile nel Brogliaccio, dove è stata appena registrata la riga di cambio stato).
     const nextLog = [logEntry, ...log].map((l) => (
-      statoId === "in_ospedale" && activeMission && l.missionId === activeMission.id ? { ...l, stato: "conclusa" } : l
+      statoId === "in_ospedale" && activeMission && !l.auto && l.missionId === activeMission.id ? { ...l, stato: "conclusa" } : l
     ));
     await persistLog(nextLog);
   };
@@ -460,16 +466,18 @@ export default function App() {
           .iris-body { flex-direction: column; }
           .iris-sidebar { width: 100%; position: static; max-height: none; border-right: none; border-bottom: 1px solid #1e293b; }
         }
+        @keyframes iris-blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+        .iris-dot-blink { animation: iris-blink 1.1s ease-in-out infinite; }
       `}</style>
       <TopBar currentEvent={currentEvent} tab={tab} setTab={setTab} onNuovaSerata={() => setCurrentEventId(null)} inEvent={!!currentEventId} />
       {!currentEventId ? (
         <EventoSetup events={events} onCreate={persistEvents} onSelect={setCurrentEventId} onDelete={persistEvents} />
       ) : (
         <div className="iris-body">
-          <ResourceStatusBar resources={resources} onSetStato={setResourceStato} onExportBrogliaccio={() => exportBrogliaccioCsv(log)} onExportMissioni={() => exportMissioniCsv(missions)} />
+          <ResourceStatusBar resources={resources} missions={missions} onSetStato={setResourceStato} onExportBrogliaccio={() => exportBrogliaccioCsv(log)} onExportMissioni={() => exportMissioniCsv(missions)} />
           <div className="iris-main">
             {tab === "risorse" && <Risorse resources={resources} onChange={persistResources} />}
-            {tab === "attivazioni" && !wizardOpen && <Attivazioni log={log} onNuova={() => setWizardOpen(true)} onApriScheda={apriSchedaDaLog} onConcludi={concludiAttivazione} />}
+            {tab === "attivazioni" && !wizardOpen && <Attivazioni log={log} missions={missions} resources={resources} onNuova={() => setWizardOpen(true)} onApriScheda={apriSchedaDaLog} onConcludi={concludiAttivazione} />}
             {tab === "attivazioni" && wizardOpen && <Wizard resources={resources} onCancel={() => setWizardOpen(false)} onComplete={handleWizardComplete} />}
             {tab === "brogliaccio" && <Brogliaccio log={log} onChange={persistLog} resources={resources} onApriScheda={apriSchedaDaLog} />}
             {tab === "missioni" && <Missioni missions={missions} resources={resources} onChange={persistMissions} openId={openMissionId} setOpenId={setOpenMissionId} />}
@@ -517,7 +525,7 @@ function TopBar({ currentEvent, tab, setTab, onNuovaSerata, inEvent }) {
 const TIPO_ICON = { Ambulanza: Ambulance, Radio: Radio, Personale: Users };
 const sidebarTitle = { fontSize: 11, textTransform: "uppercase", letterSpacing: 1, color: "#64748b", marginBottom: 10, padding: "0 4px", fontWeight: 700 };
 
-function ResourceStatusBar({ resources, onSetStato, onExportBrogliaccio, onExportMissioni }) {
+function ResourceStatusBar({ resources, missions, onSetStato, onExportBrogliaccio, onExportMissioni }) {
   return (
     <div className="iris-sidebar">
       <div style={sidebarTitle}>Stato risorse</div>
@@ -525,7 +533,7 @@ function ResourceStatusBar({ resources, onSetStato, onExportBrogliaccio, onExpor
         <div style={{ fontSize: 12, color: "#64748b", padding: "0 4px 10px" }}>Nessuna risorsa inserita. Aggiungile nella sezione Risorse.</div>
       )}
       {resources.map((r) => (
-        <ResourceStatusCard key={r.id} resource={r} onSetStato={(statoId, custom) => onSetStato(r.id, statoId, custom)} />
+        <ResourceStatusCard key={r.id} resource={r} missions={missions} onSetStato={(statoId, custom) => onSetStato(r.id, statoId, custom)} />
       ))}
 
       <div style={{ ...sidebarTitle, marginTop: 20 }}>Esporta dati</div>
@@ -539,13 +547,14 @@ function ResourceStatusBar({ resources, onSetStato, onExportBrogliaccio, onExpor
   );
 }
 
-function ResourceStatusCard({ resource, onSetStato }) {
+function ResourceStatusCard({ resource, missions, onSetStato }) {
   const [customOpen, setCustomOpen] = useState(false);
   const [customText, setCustomText] = useState("");
   const current = resource.stato || "operativo";
   const def = current === "altro" ? STATO_ALTRO : (STATI_MEZZO.find((s) => s.id === current) || STATI_MEZZO[0]);
   const badgeLabel = current === "altro" ? (resource.statoLabel || "Altro") : def.label;
   const Icon = TIPO_ICON[resource.tipo] || Ambulance;
+  const missioneAttiva = findActiveMissionForResource(missions, resource.id);
 
   const handleSelect = (e) => {
     const val = e.target.value;
@@ -558,25 +567,36 @@ function ResourceStatusCard({ resource, onSetStato }) {
     onSetStato("altro", customText.trim());
     setCustomText(""); setCustomOpen(false);
   };
+  // Ri-timbra l'orario per lo stato corrente senza doverlo cambiare (es. quando il mezzo parte
+  // davvero, dopo essere già stato messo "Diretto intervento" al momento dell'attivazione).
+  const timbra = () => onSetStato(current, current === "altro" ? (resource.statoLabel || "Altro") : undefined);
 
   return (
     <div style={{ background: "#111827", border: "1px solid #1e293b", borderRadius: 8, padding: "10px 12px", marginBottom: 8 }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 8 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 4 }}>
         <Icon size={13} color="#64748b" style={{ flexShrink: 0 }} />
         <span style={{ fontWeight: 700, fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>{resource.nome}</span>
-        <span style={{ width: 8, height: 8, borderRadius: "50%", background: def.color, flexShrink: 0, boxShadow: `0 0 6px ${def.color}` }} />
+        <span className={current === "operativo" ? "" : "iris-dot-blink"} style={{ width: 8, height: 8, borderRadius: "50%", background: def.color, flexShrink: 0, boxShadow: `0 0 6px ${def.color}` }} />
       </div>
+      {missioneAttiva && (
+        <div style={{ fontSize: 10.5, color: "#38bdf8", marginBottom: 6, fontFamily: "monospace" }}>Missione N. {missioneAttiva.numero}</div>
+      )}
 
-      <div style={{ position: "relative" }}>
-        <select
-          value={current === "altro" ? "altro" : current}
-          onChange={handleSelect}
-          style={{ ...input, width: "100%", boxSizing: "border-box", appearance: "none", fontSize: 12, fontWeight: 700, color: def.color, borderColor: def.color, paddingRight: 26, cursor: "pointer" }}
-        >
-          {STATI_MEZZO.map((s) => <option key={s.id} value={s.id}>{s.label}</option>)}
-          <option value="altro">Altro…</option>
-        </select>
-        <ChevronDown size={13} style={{ position: "absolute", right: 8, top: 9, pointerEvents: "none", color: def.color }} />
+      <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+        <div style={{ position: "relative", flex: 1, minWidth: 0 }}>
+          <select
+            value={current === "altro" ? "altro" : current}
+            onChange={handleSelect}
+            style={{ ...input, width: "100%", boxSizing: "border-box", appearance: "none", fontSize: 12, fontWeight: 700, color: def.color, borderColor: def.color, paddingRight: 26, cursor: "pointer" }}
+          >
+            {STATI_MEZZO.map((s) => <option key={s.id} value={s.id}>{s.label}</option>)}
+            <option value="altro">Altro…</option>
+          </select>
+          <ChevronDown size={13} style={{ position: "absolute", right: 8, top: 9, pointerEvents: "none", color: def.color }} />
+        </div>
+        <button title="Registra ora l'orario per lo stato corrente" onClick={timbra} style={{ ...btnGhost, padding: "6px 7px", border: "1px solid #1e293b", flexShrink: 0 }}>
+          <Clock size={13} />
+        </button>
       </div>
 
       <div style={{ fontSize: 10.5, color: "#64748b", marginTop: 6 }}>{badgeLabel}{resource.statoOra ? ` · aggiornato ${resource.statoOra}` : ""}</div>
@@ -680,8 +700,21 @@ function Risorse({ resources, onChange }) {
 // Solo le vere richieste di soccorso (create dal wizard o manualmente come "attivazione"), non i
 // cambi di stato dei mezzi (quelli si vedono nel Brogliaccio). Sparisce da qui quando è conclusa
 // (es. dopo il trasporto in ospedale), ma resta comunque visibile nel Brogliaccio.
-function Attivazioni({ log, onNuova, onApriScheda, onConcludi }) {
-  const attivazioni = log.filter((l) => l.missionId && l.stato !== "conclusa");
+function Attivazioni({ log, missions, resources, onNuova, onApriScheda, onConcludi }) {
+  // Solo le vere richieste (non le righe automatiche di cambio stato) e non ancora concluse.
+  const attivazioni = log.filter((l) => l.missionId && l.stato !== "conclusa" && !l.auto);
+
+  // La scheda missione (dati paziente) si apre solo quando almeno un mezzo assegnato è "Sull'intervento":
+  // durante l'attivazione o il rientro il paziente non è ancora/più davanti all'equipaggio.
+  const prontaPerScheda = (l) => {
+    const m = missions.find((mm) => mm.id === l.missionId);
+    if (!m || !m.risorse || m.risorse.length === 0) return true; // nessuna risorsa assegnata: nulla da verificare
+    return m.risorse.some((rr) => {
+      const res = resources.find((x) => x.id === rr.resourceId);
+      return res && res.stato === "sul_intervento";
+    });
+  };
+
   return (
     <div>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
@@ -689,20 +722,30 @@ function Attivazioni({ log, onNuova, onApriScheda, onConcludi }) {
         <button style={btnPrimary} onClick={onNuova}><Siren size={16} /> Nuova attivazione</button>
       </div>
       {attivazioni.length === 0 && <div style={{ color: "#64748b", fontSize: 13, padding: 20, textAlign: "center" }}>Nessuna attivazione in corso.</div>}
-      {attivazioni.map((l) => (
-        <div key={l.id} style={{ ...card, padding: "12px 14px", marginBottom: 8, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-          <span style={{ fontFamily: "monospace", color: "#38bdf8", fontWeight: 700 }}><Clock size={12} style={{ marginRight: 4, verticalAlign: -1 }} />{l.ora}</span>
-          {l.numero && <span style={{ fontFamily: "monospace", fontSize: 11, color: "#64748b", background: "#0f172a", padding: "2px 6px", borderRadius: 4 }}>N. {l.numero}</span>}
-          <span style={{ fontWeight: 600 }}>{l.tipoEvento}</span>
-          {l.luogo && <span style={{ color: "#64748b", fontSize: 13 }}>@ {l.luogo}</span>}
-          <span style={{ color: "#94a3b8", fontSize: 13 }}>{l.mezzo}</span>
-          {l.codiceInvio && <Badge bg={COLORI[l.codiceInvio].bg} color="#0b1220" text={COLORI[l.codiceInvio].label} />}
-          <span style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
-            <button style={btnSecondary} onClick={() => onApriScheda(l)}>Apri scheda missione</button>
-            <button style={btnGhost} onClick={() => onConcludi(l.id)}>Concludi</button>
-          </span>
-        </div>
-      ))}
+      {attivazioni.map((l) => {
+        const pronta = prontaPerScheda(l);
+        return (
+          <div key={l.id} style={{ ...card, padding: "12px 14px", marginBottom: 8, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+            <span style={{ fontFamily: "monospace", color: "#38bdf8", fontWeight: 700 }}><Clock size={12} style={{ marginRight: 4, verticalAlign: -1 }} />{l.ora}</span>
+            {l.numero && <span style={{ fontFamily: "monospace", fontSize: 11, color: "#64748b", background: "#0f172a", padding: "2px 6px", borderRadius: 4 }}>N. {l.numero}</span>}
+            <span style={{ fontWeight: 600 }}>{l.tipoEvento}</span>
+            {l.luogo && <span style={{ color: "#64748b", fontSize: 13 }}>@ {l.luogo}</span>}
+            <span style={{ color: "#94a3b8", fontSize: 13 }}>{l.mezzo}</span>
+            {l.codiceInvio && <Badge bg={COLORI[l.codiceInvio].bg} color="#0b1220" text={COLORI[l.codiceInvio].label} />}
+            <span style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
+              <button
+                style={{ ...btnSecondary, ...(pronta ? {} : { opacity: 0.4, cursor: "not-allowed", borderColor: "#334155", color: "#64748b" }) }}
+                disabled={!pronta}
+                title={pronta ? "" : "Disponibile quando il mezzo è sull'intervento"}
+                onClick={() => pronta && onApriScheda(l)}
+              >
+                Apri scheda missione
+              </button>
+              <button style={btnGhost} onClick={() => onConcludi(l.id)}>Concludi</button>
+            </span>
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -801,6 +844,24 @@ function Missioni({ missions, resources, onChange, openId, setOpenId }) {
           <ChevronRight size={16} color="#64748b" />
         </div>
       ))}
+    </div>
+  );
+}
+
+// Popup di conferma per azioni distruttive (es. eliminazione di una scheda missione).
+function ConfirmDialog({ title, message, confirmLabel, onConfirm, onCancel }) {
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(2,6,23,0.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 200, padding: 16 }} onClick={onCancel}>
+      <div style={{ ...card, maxWidth: 380, width: "100%" }} onClick={(e) => e.stopPropagation()}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, fontWeight: 700, fontSize: 15, marginBottom: 8 }}>
+          <AlertTriangle size={16} color="#f87171" /> {title}
+        </div>
+        <div style={{ fontSize: 13, color: "#94a3b8", marginBottom: 18 }}>{message}</div>
+        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+          <button style={btnGhost} onClick={onCancel}>Annulla</button>
+          <button style={{ ...btnPrimary, background: "#dc2626" }} onClick={onConfirm}>{confirmLabel || "Elimina"}</button>
+        </div>
+      </div>
     </div>
   );
 }
@@ -936,8 +997,10 @@ function RisorseMissione({ missionRisorse, allResources, onChange }) {
           </div>
           <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
             <TimeField label="Attivazione" value={r.oraAttivazione} onChange={(v) => update(r.resourceId, { oraAttivazione: v })} />
+            <TimeField label="Partenza" value={r.oraPartenza} onChange={(v) => update(r.resourceId, { oraPartenza: v })} />
             <TimeField label="Sul posto" value={r.oraSulPosto} onChange={(v) => update(r.resourceId, { oraSulPosto: v })} />
             <TimeField label="Trasporto" value={r.oraTrasporto} onChange={(v) => update(r.resourceId, { oraTrasporto: v })} />
+            <TimeField label="Ospedale" value={r.oraOspedale} onChange={(v) => update(r.resourceId, { oraOspedale: v })} />
             <TimeField label="Rientro operativo" value={r.oraRitorno} onChange={(v) => update(r.resourceId, { oraRitorno: v })} />
           </div>
         </div>
@@ -956,6 +1019,7 @@ function RisorseMissione({ missionRisorse, allResources, onChange }) {
 // ================= Scheda missione (multi-paziente) =================
 function SchedaMissione({ mission: m, resources, onUpdateMission, onUpdatePaziente, onAddPaziente, onRemovePaziente, onClose, onDelete }) {
   const [activeId, setActiveId] = useState(m.pazienti[0]?.id);
+  const [confirmDelete, setConfirmDelete] = useState(false);
   useEffect(() => { if (!m.pazienti.find((p) => p.id === activeId)) setActiveId(m.pazienti[0]?.id); }, [m.pazienti]); // eslint-disable-line
   const p = m.pazienti.find((x) => x.id === activeId) || m.pazienti[0];
   const suggerito = suggerisciColoreTrasporto(p);
@@ -967,7 +1031,7 @@ function SchedaMissione({ mission: m, resources, onUpdateMission, onUpdatePazien
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
         <button style={btnGhost} onClick={onClose}><X size={14} /> Torna alle schede</button>
         <div style={{ fontFamily: "monospace", fontSize: 13, color: "#38bdf8", fontWeight: 700 }}>Scheda missione N. {m.numero}</div>
-        <button style={{ ...btnGhost, color: "#f87171" }} onClick={() => { if (confirm("Eliminare questa scheda missione?")) onDelete(); }}><Trash2 size={14} /> Elimina</button>
+        <button style={{ ...btnGhost, color: "#f87171" }} onClick={() => setConfirmDelete(true)}><Trash2 size={14} /> Elimina</button>
       </div>
 
       <Section title="Dati missione">
@@ -998,6 +1062,7 @@ function SchedaMissione({ mission: m, resources, onUpdateMission, onUpdatePazien
           <input style={{ ...input, flex: 1, minWidth: 140 }} placeholder="Nome" value={p.nome} onChange={(e) => setP({ nome: e.target.value })} />
           <select style={{ ...input, width: 90 }} value={p.sesso} onChange={(e) => setP({ sesso: e.target.value })}><option value="">Sesso</option><option value="M">M</option><option value="F">F</option></select>
           <input style={{ ...input, width: 90 }} placeholder="Età" value={p.eta} onChange={(e) => setP({ eta: e.target.value })} />
+          <input style={{ ...input, flex: 1, minWidth: 180 }} placeholder="Codice fiscale" value={p.codiceFiscale} onChange={(e) => setP({ codiceFiscale: e.target.value.toUpperCase() })} maxLength={16} />
         </div>
       </Section>
 
@@ -1083,6 +1148,16 @@ function SchedaMissione({ mission: m, resources, onUpdateMission, onUpdatePazien
       <div style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 12, color: "#64748b", fontSize: 12 }}>
         <AlertTriangle size={13} /> Strumento di supporto alla registrazione: il codice colore definitivo resta una decisione clinica dell'operatore, secondo il protocollo del proprio servizio.
       </div>
+
+      {confirmDelete && (
+        <ConfirmDialog
+          title="Eliminare questa scheda missione?"
+          message={`La scheda N. ${m.numero} e i dati di tutti i pazienti collegati verranno eliminati definitivamente.`}
+          confirmLabel="Elimina scheda"
+          onCancel={() => setConfirmDelete(false)}
+          onConfirm={() => { setConfirmDelete(false); onDelete(); }}
+        />
+      )}
     </div>
   );
 }
