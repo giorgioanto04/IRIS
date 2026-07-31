@@ -387,6 +387,7 @@ export default function App() {
   const [tipiRisorsa, setTipiRisorsa] = useState(TIPI_RISORSA_BASE);
   const [sheetsUrl, setSheetsUrl] = useState("");
   const [syncStatus, setSyncStatus] = useState(""); // messaggio di stato sincronizzazione mostrato accanto ai tasti "Salva"
+  const [connectionStatus, setConnectionStatus] = useState("offline");
 
   useEffect(() => { (async () => {
     setEvents(await loadKey("events", []));
@@ -422,9 +423,9 @@ export default function App() {
       const r = await sheetsGet(sheetsUrl, `resources:${currentEventId}`);
       const l = await sheetsGet(sheetsUrl, `log:${currentEventId}`);
       const m = await sheetsGet(sheetsUrl, `missions:${currentEventId}`);
-      if (r) await persistResources(r);
-      if (l) await persistLog(l);
-      if (m) await persistMissions(m);
+      if (r) { setResources(r); await saveKey(`resources:${currentEventId}`, r); }
+      if (l) { setLog(l); await saveKey(`log:${currentEventId}`, l); }
+      if (m) { setMissions(m); await saveKey(`missions:${currentEventId}`, m); }
       setSyncStatus("Dati aggiornati da Google Sheet ✓ (" + nowTime() + ")");
     } catch (err) {
       console.error("Errore caricamento Google Sheet:", err);
@@ -454,13 +455,15 @@ export default function App() {
 
   const autoSyncKv = useCallback((key, value) => {
     if (!sheetsUrl) return;
+    setConnectionStatus("syncing");
     setSyncStatus("Sincronizzazione…");
     sheetsPost(sheetsUrl, { action: "kv", key, value })
       .then((res) => {
         if (res && res.updated) remoteTs.current[key] = res.updated;
+        setConnectionStatus("connected");
         setSyncStatus("Sincronizzato con Google Sheet ✓ (" + nowTime() + ")");
       })
-      .catch((err) => { console.error("Auto-sync Google Sheet:", err); setSyncStatus("Sincronizzazione automatica non riuscita: controlla l'URL in Impostazioni."); });
+      .catch((err) => { console.error("Auto-sync Google Sheet:", err); setConnectionStatus("error"); setSyncStatus("Sincronizzazione automatica non riuscita: controlla l'URL in Impostazioni."); });
   }, [sheetsUrl]);
 
   // Polling automatico multi-dispositivo: ogni 1.5s, se è configurato un Google Sheet, chiede al
@@ -478,6 +481,7 @@ export default function App() {
         }
         const values = await sheetsGetMany(sheetsUrl, keys);
         if (cancelled) return;
+        setConnectionStatus("connected");
         for (const key of keys) {
           const entry = values[key];
           if (!entry || entry.value == null) continue;
@@ -493,10 +497,11 @@ export default function App() {
         }
       } catch (err) {
         console.error("Polling Google Sheet:", err);
+        if (!cancelled) setConnectionStatus("error");
       }
     };
     poll();
-    const id = setInterval(poll, 1500);
+    const id = setInterval(poll, 1000);
     return () => { cancelled = true; clearInterval(id); };
   }, [sheetsUrl, currentEventId]);
 
@@ -554,14 +559,17 @@ export default function App() {
       stato: statoId === "operativo" ? "conclusa" : "in corso",
       missionId: activeMission ? activeMission.id : null,
       numero: activeMission ? activeMission.numero : null,
-      codiceInvio: "", creato: Date.now(), auto: true,
+      codiceInvio: "", creato: Date.now(), auto: true, resourceId, statoId,
     };
 
     // Arrivo in ospedale = trasporto concluso: la richiesta esce dalla lista Attivazioni
     // (resta comunque visibile nel Brogliaccio, dove è stata appena registrata la riga di cambio stato).
-    const nextLog = [logEntry, ...log].map((l) => (
-      statoId === "in_ospedale" && activeMission && !l.auto && l.missionId === activeMission.id ? { ...l, stato: "conclusa" } : l
-    ));
+    const nextLog = [logEntry, ...log].map((l) => {
+      const sameResource = l.resourceId === resourceId || (!l.resourceId && l.auto && l.mezzo === r.nome);
+      const previousState = l.auto && sameResource && l.stato === "in corso";
+      const missionClosed = statoId === "in_ospedale" && activeMission && !l.auto && l.missionId === activeMission.id;
+      return previousState || missionClosed ? { ...l, stato: "conclusa" } : l;
+    });
     await persistLog(nextLog);
   };
 
@@ -624,7 +632,7 @@ export default function App() {
         @keyframes iris-blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
         .iris-dot-blink { animation: iris-blink 1.1s ease-in-out infinite; }
       `}</style>
-      <TopBar currentEvent={currentEvent} tab={tab} setTab={setTab} onNuovaSerata={() => setCurrentEventId(null)} inEvent={!!currentEventId} />
+      <TopBar currentEvent={currentEvent} tab={tab} setTab={setTab} onNuovaSerata={() => setCurrentEventId(null)} inEvent={!!currentEventId} connectionStatus={connectionStatus} />
       {!currentEventId ? (
         <EventoSetup events={events} onCreate={persistEvents} onSelect={setCurrentEventId} onDelete={persistEvents} />
       ) : (
@@ -645,7 +653,7 @@ export default function App() {
 }
 
 // ================= Top bar =================
-function TopBar({ currentEvent, tab, setTab, onNuovaSerata, inEvent }) {
+function TopBar({ currentEvent, tab, setTab, onNuovaSerata, inEvent, connectionStatus }) {
   const NAV = [
     { id: "risorse", label: "Risorse" },
     { id: "attivazioni", label: "Attivazioni" },
@@ -662,6 +670,10 @@ function TopBar({ currentEvent, tab, setTab, onNuovaSerata, inEvent }) {
           <div style={{ fontSize: 10, color: "#64748b", letterSpacing: 0.5, marginTop: -2 }}>Interfaccia Rapida Interventi Sanitari</div>
         </div>
         {currentEvent && <div style={{ marginLeft: 14, paddingLeft: 14, borderLeft: "1px solid #1e293b", fontSize: 13, color: "#94a3b8" }}>{currentEvent.name} · {currentEvent.date}</div>}
+      </div>
+      <div title={{ connected: "Google Sheet connesso", syncing: "Sincronizzazione in corso", error: "Google Sheet non raggiungibile", offline: "Google Sheet non configurato" }[connectionStatus]} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: "#94a3b8" }}>
+        <span style={{ width: 9, height: 9, borderRadius: "50%", background: { connected: "#22c55e", syncing: "#eab308", error: "#ef4444", offline: "#64748b" }[connectionStatus], boxShadow: connectionStatus === "connected" ? "0 0 8px #22c55e" : "none" }} />
+        {connectionStatus === "connected" ? "Connesso" : connectionStatus === "syncing" ? "Sincronizzazione…" : connectionStatus === "error" ? "Offline" : "Non configurato"}
       </div>
       {inEvent && (
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
@@ -1499,5 +1511,3 @@ const btnSecondary = { display: "flex", alignItems: "center", gap: 6, background
 const btnGhost = { display: "flex", alignItems: "center", gap: 6, background: "transparent", color: "#94a3b8", border: "none", borderRadius: 6, padding: "6px 10px", fontWeight: 600, fontSize: 12, cursor: "pointer" };
 const toggleBtn = { background: "#0f172a", border: "1px solid #1e293b", color: "#94a3b8", borderRadius: 6, padding: "7px 12px", fontSize: 12, fontWeight: 600, cursor: "pointer" };
 const activeToggle = { background: "#0c4a6e", color: "#7dd3fc", borderColor: "#38bdf8" };
-
-
