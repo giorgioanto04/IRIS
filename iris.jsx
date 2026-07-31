@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useRef } from "react";
 import {
   Radio, Ambulance, Users, ClipboardList, Plus, Trash2, Download, X,
   AlertTriangle, ChevronRight, ChevronDown, Clock, Siren, ArrowRight,
@@ -256,6 +256,14 @@ async function sheetsGet(url, key) {
   if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
   return data.value != null ? data.value : null;
 }
+// Legge più chiavi in una sola richiesta (usato dal polling automatico ogni 1-2s):
+// restituisce { chiave: { value, updated } } per ogni chiave richiesta.
+async function sheetsGetMany(url, keys) {
+  const res = await fetch(`${url}?keys=${encodeURIComponent(keys.join(","))}`, { method: "GET" });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
+  return data.values || {};
+}
 
 // ================= Wizard attivazione =================
 const WIZARD_STEPS = [
@@ -439,13 +447,58 @@ export default function App() {
   // Sincronizzazione automatica in background: ogni volta che qualcosa viene salvato localmente,
   // se è configurato un Google Sheet lo si aggiorna subito anche lì, senza bisogno di premere un tasto.
   // È "fire and forget": non blocca l'interfaccia e non impedisce il salvataggio locale se fallisce.
+  // Tiene traccia, per ogni chiave, dell'ultimo timestamp "aggiornato" che questo dispositivo
+  // ha già applicato o inviato: serve al polling per capire se sul foglio c'è qualcosa di più
+  // recente arrivato da un ALTRO dispositivo, senza riapplicare in loop i propri stessi dati.
+  const remoteTs = useRef({});
+
   const autoSyncKv = useCallback((key, value) => {
     if (!sheetsUrl) return;
     setSyncStatus("Sincronizzazione…");
     sheetsPost(sheetsUrl, { action: "kv", key, value })
-      .then(() => setSyncStatus("Sincronizzato con Google Sheet ✓ (" + nowTime() + ")"))
+      .then((res) => {
+        if (res && res.updated) remoteTs.current[key] = res.updated;
+        setSyncStatus("Sincronizzato con Google Sheet ✓ (" + nowTime() + ")");
+      })
       .catch((err) => { console.error("Auto-sync Google Sheet:", err); setSyncStatus("Sincronizzazione automatica non riuscita: controlla l'URL in Impostazioni."); });
   }, [sheetsUrl]);
+
+  // Polling automatico multi-dispositivo: ogni 1.5s, se è configurato un Google Sheet, chiede al
+  // foglio lo stato di "eventi" e (se un evento è aperto) di risorse/log/missioni. Se il foglio ha
+  // una versione più recente di quella già vista da questo dispositivo, la applica in locale — così
+  // un'attivazione fatta dal tablet appare da sola sul PC entro 1-2 secondi, senza dover premere nulla.
+  useEffect(() => {
+    if (!sheetsUrl) return;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const keys = ["events"];
+        if (currentEventId) {
+          keys.push(`resources:${currentEventId}`, `log:${currentEventId}`, `missions:${currentEventId}`);
+        }
+        const values = await sheetsGetMany(sheetsUrl, keys);
+        if (cancelled) return;
+        for (const key of keys) {
+          const entry = values[key];
+          if (!entry || entry.value == null) continue;
+          const seen = remoteTs.current[key] || 0;
+          if (entry.updated > seen) {
+            remoteTs.current[key] = entry.updated;
+            if (key === "events") setEvents(entry.value);
+            else if (key === `resources:${currentEventId}`) setResources(entry.value);
+            else if (key === `log:${currentEventId}`) setLog(entry.value);
+            else if (key === `missions:${currentEventId}`) setMissions(entry.value);
+            await saveKey(key, entry.value); // aggiorna anche la copia locale del dispositivo
+          }
+        }
+      } catch (err) {
+        console.error("Polling Google Sheet:", err);
+      }
+    };
+    poll();
+    const id = setInterval(poll, 1500);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [sheetsUrl, currentEventId]);
 
   const persistEvents = useCallback(async (next) => { setEvents(next); await saveKey("events", next); autoSyncKv("events", next); }, [autoSyncKv]);
   const persistResources = useCallback(async (next) => { setResources(next); await saveKey(`resources:${currentEventId}`, next); autoSyncKv(`resources:${currentEventId}`, next); }, [currentEventId, autoSyncKv]);
@@ -887,9 +940,13 @@ function Impostazioni({ sheetsUrl, onChangeSheetsUrl, onSyncNow, onLoadNow, sync
         <div style={{ fontWeight: 700, marginBottom: 8 }}>Google Sheet condiviso (multi-dispositivo)</div>
         <div style={{ fontSize: 13, color: "#94a3b8", marginBottom: 12, lineHeight: 1.5 }}>
           Incolla qui l'URL dell'"app web" di Google Apps Script collegata al tuo Google Sheet.
-          Una volta configurato, i tasti "Salva su Google Sheet" (nell'Attivazione e nella Scheda missione)
-          scrivono i dati sul foglio, così puoi lavorare da più computer o dal cellulare vedendo sempre
-          la stessa situazione. Vedi in fondo a questa pagina le istruzioni passo passo per crearlo.
+          Una volta incollato e salvato <b>su questo dispositivo</b>, non serve più fare nulla: ogni
+          modifica (attivazione, cambio stato mezzo, scheda paziente…) viene scritta subito sul foglio,
+          e ogni dispositivo collegato allo stesso URL controlla automaticamente ogni 1-2 secondi se
+          c'è qualcosa di nuovo dagli altri dispositivi, aggiornandosi da solo — niente più tasti
+          "Carica dati" da premere. L'unico passaggio manuale è incollare questo stesso URL su ciascun
+          dispositivo (tablet, PC, cellulare) la prima volta: da lì in poi restano sincronizzati da soli.
+          Vedi in fondo a questa pagina le istruzioni passo passo per crearlo.
         </div>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
           <input
