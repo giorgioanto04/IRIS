@@ -10,7 +10,11 @@ const COLORI = {
   giallo: { bg: "#eab308", label: "GIALLO", desc: "Urgente" },
   rosso: { bg: "#dc2626", label: "ROSSO", desc: "Emergenza" },
 };
-const TIPI_RISORSA = ["Ambulanza", "Radio", "Personale"];
+// Elenco di base dei tipi di risorsa: l'utente può aggiungerne altri dal pannello "Risorse"
+// (es. "Motomedica", "Automedica"...). "PMA" e "Ospedale" sono tipi speciali che rappresentano
+// una postazione/presidio (non un mezzo mobile) a cui si possono agganciare uno o più medici.
+const TIPI_RISORSA_BASE = ["Ambulanza", "Automedica", "Radio", "Personale", "PMA", "Ospedale"];
+const TIPI_POSTAZIONE = ["PMA", "Ospedale"]; // tipi che gestiscono un elenco di medici invece dello stato di marcia
 
 // Stati rapidi del mezzo/risorsa, mostrati nella barra laterale.
 // "campo" indica quale orario della scheda missione viene aggiornato quando si seleziona lo stato.
@@ -232,6 +236,27 @@ async function saveKey(key, value) {
   } catch (e) { console.error("storage error", e); }
 }
 
+// ================= Google Sheet (multi-dispositivo) =================
+// IRIS può appoggiarsi a un foglio Google, tramite un piccolo Google Apps Script pubblicato come
+// "app web" (vedi Impostazioni per le istruzioni). Si usa "text/plain" nel Content-Type per evitare
+// che il browser mandi una richiesta preflight CORS che Apps Script non gestisce.
+async function sheetsPost(url, payload) {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "text/plain;charset=utf-8" },
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
+  return data;
+}
+async function sheetsGet(url, key) {
+  const res = await fetch(`${url}?key=${encodeURIComponent(key)}`, { method: "GET" });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
+  return data.value != null ? data.value : null;
+}
+
 // ================= Wizard attivazione =================
 const WIZARD_STEPS = [
   { id: "motivo", text: "Cosa è successo? (motivo della chiamata)", type: "text" },
@@ -351,8 +376,53 @@ export default function App() {
   const [missionSeq, setMissionSeq] = useState(0);
   const [wizardOpen, setWizardOpen] = useState(false);
   const [openMissionId, setOpenMissionId] = useState(null);
+  const [tipiRisorsa, setTipiRisorsa] = useState(TIPI_RISORSA_BASE);
+  const [sheetsUrl, setSheetsUrl] = useState("");
+  const [syncStatus, setSyncStatus] = useState(""); // messaggio di stato sincronizzazione mostrato accanto ai tasti "Salva"
 
-  useEffect(() => { (async () => { setEvents(await loadKey("events", [])); setLoading(false); })(); }, []);
+  useEffect(() => { (async () => {
+    setEvents(await loadKey("events", []));
+    setTipiRisorsa(await loadKey("tipiRisorsa", TIPI_RISORSA_BASE));
+    setSheetsUrl(await loadKey("sheetsUrl", ""));
+    setLoading(false);
+  })(); }, []);
+
+  const persistTipiRisorsa = useCallback(async (next) => { setTipiRisorsa(next); await saveKey("tipiRisorsa", next); }, []);
+  const persistSheetsUrl = useCallback(async (next) => { setSheetsUrl(next); await saveKey("sheetsUrl", next); }, []);
+
+  // Sincronizzazione manuale con Google Sheet: invia lo stato attuale (risorse, log, missioni)
+  // sia come "riga leggibile" (foglio Missioni) sia come copia grezza per il multi-dispositivo (foglio Storage).
+  const syncToSheet = useCallback(async (mission) => {
+    if (!sheetsUrl) { setSyncStatus("Nessun URL Google Sheet configurato (vedi Impostazioni)."); return; }
+    setSyncStatus("Salvataggio in corso…");
+    try {
+      await sheetsPost(sheetsUrl, { action: "kv", key: `resources:${currentEventId}`, value: resources });
+      await sheetsPost(sheetsUrl, { action: "kv", key: `log:${currentEventId}`, value: log });
+      await sheetsPost(sheetsUrl, { action: "kv", key: `missions:${currentEventId}`, value: missions });
+      if (mission) await sheetsPost(sheetsUrl, { action: "saveMission", mission });
+      setSyncStatus("Salvato su Google Sheet ✓ (" + nowTime() + ")");
+    } catch (err) {
+      console.error("Errore sincronizzazione Google Sheet:", err);
+      setSyncStatus("Errore di sincronizzazione: controlla l'URL nelle Impostazioni.");
+    }
+  }, [sheetsUrl, currentEventId, resources, log, missions]);
+
+  const loadFromSheet = useCallback(async () => {
+    if (!sheetsUrl) { setSyncStatus("Nessun URL Google Sheet configurato (vedi Impostazioni)."); return; }
+    setSyncStatus("Caricamento da Google Sheet…");
+    try {
+      const r = await sheetsGet(sheetsUrl, `resources:${currentEventId}`);
+      const l = await sheetsGet(sheetsUrl, `log:${currentEventId}`);
+      const m = await sheetsGet(sheetsUrl, `missions:${currentEventId}`);
+      if (r) await persistResources(r);
+      if (l) await persistLog(l);
+      if (m) await persistMissions(m);
+      setSyncStatus("Dati aggiornati da Google Sheet ✓ (" + nowTime() + ")");
+    } catch (err) {
+      console.error("Errore caricamento Google Sheet:", err);
+      setSyncStatus("Errore nel caricamento: controlla l'URL nelle Impostazioni.");
+    }
+  }, [sheetsUrl, currentEventId]);
 
   useEffect(() => {
     if (!currentEventId) return;
@@ -420,6 +490,16 @@ export default function App() {
     await persistLog(nextLog);
   };
 
+  // Quando una risorsa viene agganciata a una missione (sia dal wizard, sia aggiungendola in un
+  // secondo momento dalla scheda missione), passa automaticamente a "Diretto intervento" se era
+  // ancora "Operativo": prima questo succedeva solo per le risorse scelte nel wizard iniziale.
+  const assegnaRisorsaAMissione = async (resourceId) => {
+    const r = resources.find((x) => x.id === resourceId);
+    if (!r || (r.stato && r.stato !== "operativo")) return; // non tocca uno stato più avanzato già impostato
+    const ora = nowTime();
+    await persistResources(resources.map((x) => (x.id === resourceId ? { ...x, stato: "diretto_intervento", statoLabel: "Diretto intervento", statoOra: ora } : x)));
+  };
+
   // Chiude manualmente un'attivazione dalla scheda "Attivazioni": sparisce da lì ma resta nel Brogliaccio.
   const concludiAttivazione = async (logId) => {
     await persistLog(log.map((l) => (l.id === logId ? { ...l, stato: "conclusa" } : l)));
@@ -476,11 +556,12 @@ export default function App() {
         <div className="iris-body">
           <ResourceStatusBar resources={resources} missions={missions} onSetStato={setResourceStato} onExportBrogliaccio={() => exportBrogliaccioCsv(log)} onExportMissioni={() => exportMissioniCsv(missions)} />
           <div className="iris-main">
-            {tab === "risorse" && <Risorse resources={resources} onChange={persistResources} />}
-            {tab === "attivazioni" && !wizardOpen && <Attivazioni log={log} missions={missions} resources={resources} onNuova={() => setWizardOpen(true)} onApriScheda={apriSchedaDaLog} onConcludi={concludiAttivazione} />}
+            {tab === "risorse" && <Risorse resources={resources} onChange={persistResources} tipiRisorsa={tipiRisorsa} onChangeTipi={persistTipiRisorsa} />}
+            {tab === "attivazioni" && !wizardOpen && <Attivazioni log={log} missions={missions} resources={resources} onNuova={() => setWizardOpen(true)} onApriScheda={apriSchedaDaLog} onConcludi={concludiAttivazione} onSync={() => syncToSheet(null)} syncStatus={syncStatus} sheetsConfigured={!!sheetsUrl} />}
             {tab === "attivazioni" && wizardOpen && <Wizard resources={resources} onCancel={() => setWizardOpen(false)} onComplete={handleWizardComplete} />}
             {tab === "brogliaccio" && <Brogliaccio log={log} onChange={persistLog} resources={resources} onApriScheda={apriSchedaDaLog} />}
-            {tab === "missioni" && <Missioni missions={missions} resources={resources} onChange={persistMissions} openId={openMissionId} setOpenId={setOpenMissionId} />}
+            {tab === "missioni" && <Missioni missions={missions} resources={resources} onChange={persistMissions} openId={openMissionId} setOpenId={setOpenMissionId} onAssignResource={assegnaRisorsaAMissione} onSync={syncToSheet} syncStatus={syncStatus} sheetsConfigured={!!sheetsUrl} />}
+            {tab === "impostazioni" && <Impostazioni sheetsUrl={sheetsUrl} onChangeSheetsUrl={persistSheetsUrl} onSyncNow={() => syncToSheet(null)} onLoadNow={loadFromSheet} syncStatus={syncStatus} />}
           </div>
         </div>
       )}
@@ -495,6 +576,7 @@ function TopBar({ currentEvent, tab, setTab, onNuovaSerata, inEvent }) {
     { id: "attivazioni", label: "Attivazioni" },
     { id: "brogliaccio", label: "Brogliaccio" },
     { id: "missioni", label: "Schede missione" },
+    { id: "impostazioni", label: "Impostazioni" },
   ];
   return (
     <div style={{ borderBottom: "1px solid #1e293b", padding: "12px 20px", display: "flex", alignItems: "center", justifyContent: "space-between", position: "sticky", top: 0, background: "#0b1220", zIndex: 10, flexWrap: "wrap", gap: 10 }}>
@@ -659,32 +741,108 @@ function EventoSetup({ events, onCreate, onSelect, onDelete }) {
 }
 
 // ================= Risorse =================
-function Risorse({ resources, onChange }) {
+function Risorse({ resources, onChange, tipiRisorsa, onChangeTipi }) {
   const [form, setForm] = useState({ tipo: "Ambulanza", nome: "", ruolo: "", note: "" });
-  const add = () => { if (!form.nome.trim()) return; onChange([{ id: uid(), ...form, nome: form.nome.trim() }, ...resources]); setForm({ ...form, nome: "", ruolo: "", note: "" }); };
+  const [nuovoTipo, setNuovoTipo] = useState("");
+  const [showTipiPanel, setShowTipiPanel] = useState(false);
+  const [nuovoMedico, setNuovoMedico] = useState({});
+  const add = () => { if (!form.nome.trim()) return; onChange([{ id: uid(), ...form, nome: form.nome.trim(), medici: TIPI_POSTAZIONE.includes(form.tipo) ? [] : undefined }, ...resources]); setForm({ ...form, nome: "", ruolo: "", note: "" }); };
   const remove = (id) => onChange(resources.filter((r) => r.id !== id));
+  const update = (id, patch) => onChange(resources.map((r) => (r.id === id ? { ...r, ...patch } : r)));
+
+  const aggiungiTipo = () => {
+    const t = nuovoTipo.trim();
+    if (!t || tipiRisorsa.includes(t)) return;
+    onChangeTipi([...tipiRisorsa, t]);
+    setNuovoTipo("");
+  };
+  const rimuoviTipo = (t) => {
+    if (TIPI_RISORSA_BASE.includes(t)) return; // i tipi di base non si possono rimuovere
+    onChangeTipi(tipiRisorsa.filter((x) => x !== t));
+  };
+
+  const aggiungiMedico = (resourceId) => {
+    const nome = (nuovoMedico[resourceId] || "").trim();
+    if (!nome) return;
+    const r = resources.find((x) => x.id === resourceId);
+    update(resourceId, { medici: [...(r.medici || []), nome] });
+    setNuovoMedico({ ...nuovoMedico, [resourceId]: "" });
+  };
+  const rimuoviMedico = (resourceId, nome) => {
+    const r = resources.find((x) => x.id === resourceId);
+    update(resourceId, { medici: (r.medici || []).filter((m) => m !== nome) });
+  };
+
   return (
     <div>
+      <div style={{ ...card, marginBottom: 12 }}>
+        <button style={btnGhost} onClick={() => setShowTipiPanel((v) => !v)}>
+          {showTipiPanel ? <ChevronDown size={14} /> : <ChevronRight size={14} />} Gestisci tipi di risorsa (mezzi, postazioni…)
+        </button>
+        {showTipiPanel && (
+          <div style={{ marginTop: 10 }}>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
+              {tipiRisorsa.map((t) => (
+                <span key={t} style={{ ...toggleBtn, display: "flex", alignItems: "center", gap: 6, cursor: "default" }}>
+                  {t}
+                  {!TIPI_RISORSA_BASE.includes(t) && (
+                    <Trash2 size={12} style={{ cursor: "pointer", color: "#f87171" }} onClick={() => rimuoviTipo(t)} />
+                  )}
+                </span>
+              ))}
+            </div>
+            <div style={{ fontSize: 12, color: "#64748b", marginBottom: 8 }}>
+              Aggiungi un nuovo tipo di mezzo/risorsa (es. "Motomedica", "Elisoccorso", "Nucleo NBCR"…). "PMA" e "Ospedale" sono tipi speciali di postazione a cui si possono agganciare uno o più medici.
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <input style={{ ...input, flex: 1, minWidth: 160 }} placeholder="Nuovo tipo di risorsa…" value={nuovoTipo} onChange={(e) => setNuovoTipo(e.target.value)} />
+              <button style={btnSecondary} onClick={aggiungiTipo}><Plus size={14} /> Aggiungi tipo</button>
+            </div>
+          </div>
+        )}
+      </div>
+
       <div style={card}>
         <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-          <select style={{ ...input, width: 140 }} value={form.tipo} onChange={(e) => setForm({ ...form, tipo: e.target.value })}>{TIPI_RISORSA.map((t) => <option key={t}>{t}</option>)}</select>
-          <input style={{ ...input, flex: 1, minWidth: 160 }} placeholder={form.tipo === "Personale" ? "Nome e cognome" : "Sigla / nome mezzo"} value={form.nome} onChange={(e) => setForm({ ...form, nome: e.target.value })} />
+          <select style={{ ...input, width: 160 }} value={form.tipo} onChange={(e) => setForm({ ...form, tipo: e.target.value })}>{tipiRisorsa.map((t) => <option key={t}>{t}</option>)}</select>
+          <input style={{ ...input, flex: 1, minWidth: 160 }} placeholder={form.tipo === "Personale" ? "Nome e cognome" : TIPI_POSTAZIONE.includes(form.tipo) ? "Nome della postazione (es. PMA 1)" : "Sigla / nome mezzo"} value={form.nome} onChange={(e) => setForm({ ...form, nome: e.target.value })} />
           <input style={{ ...input, flex: 1, minWidth: 140 }} placeholder="Ruolo" value={form.ruolo} onChange={(e) => setForm({ ...form, ruolo: e.target.value })} />
           <input style={{ ...input, flex: 1, minWidth: 140 }} placeholder="Note" value={form.note} onChange={(e) => setForm({ ...form, note: e.target.value })} />
           <button style={btnPrimary} onClick={add}><Plus size={16} /> Aggiungi</button>
         </div>
       </div>
       <div style={{ marginTop: 16 }}>
-        {TIPI_RISORSA.map((tipo) => {
+        {tipiRisorsa.map((tipo) => {
           const rows = resources.filter((r) => r.tipo === tipo);
           if (!rows.length) return null;
+          const isPostazione = TIPI_POSTAZIONE.includes(tipo);
           return (
             <div key={tipo} style={{ marginBottom: 18 }}>
               <div style={{ fontSize: 12, textTransform: "uppercase", letterSpacing: 1, color: "#64748b", marginBottom: 8 }}>{tipo} ({rows.length})</div>
               {rows.map((r) => (
-                <div key={r.id} style={{ ...card, display: "flex", alignItems: "center", padding: "10px 14px", marginBottom: 6 }}>
-                  <div style={{ flex: 1 }}><span style={{ fontWeight: 600 }}>{r.nome}</span>{r.ruolo && <span style={{ color: "#94a3b8", fontSize: 13 }}> · {r.ruolo}</span>}{r.note && <span style={{ color: "#64748b", fontSize: 12 }}> — {r.note}</span>}</div>
-                  <button style={btnGhost} onClick={() => remove(r.id)}><Trash2 size={14} /></button>
+                <div key={r.id} style={{ ...card, padding: "10px 14px", marginBottom: 6 }}>
+                  <div style={{ display: "flex", alignItems: "center" }}>
+                    <div style={{ flex: 1 }}><span style={{ fontWeight: 600 }}>{r.nome}</span>{r.ruolo && <span style={{ color: "#94a3b8", fontSize: 13 }}> · {r.ruolo}</span>}{r.note && <span style={{ color: "#64748b", fontSize: 12 }}> — {r.note}</span>}</div>
+                    <button style={btnGhost} onClick={() => remove(r.id)}><Trash2 size={14} /></button>
+                  </div>
+                  {isPostazione && (
+                    <div style={{ marginTop: 10, paddingTop: 10, borderTop: "1px solid #1e293b" }}>
+                      <div style={{ fontSize: 11, color: "#64748b", marginBottom: 6 }}>Medici assegnabili a questa postazione</div>
+                      <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 8 }}>
+                        {(r.medici || []).length === 0 && <span style={{ fontSize: 12, color: "#475569" }}>Nessun medico inserito.</span>}
+                        {(r.medici || []).map((doc) => (
+                          <span key={doc} style={{ ...toggleBtn, display: "flex", alignItems: "center", gap: 6, cursor: "default" }}>
+                            {doc}
+                            <Trash2 size={12} style={{ cursor: "pointer", color: "#f87171" }} onClick={() => rimuoviMedico(r.id, doc)} />
+                          </span>
+                        ))}
+                      </div>
+                      <div style={{ display: "flex", gap: 8 }}>
+                        <input style={{ ...input, flex: 1, minWidth: 140 }} placeholder="Nome medico…" value={nuovoMedico[r.id] || ""} onChange={(e) => setNuovoMedico({ ...nuovoMedico, [r.id]: e.target.value })} />
+                        <button style={btnSecondary} onClick={() => aggiungiMedico(r.id)}><Plus size={14} /> Aggiungi medico</button>
+                      </div>
+                    </div>
+                  )}
                 </div>
               ))}
             </div>
@@ -696,11 +854,63 @@ function Risorse({ resources, onChange }) {
   );
 }
 
+// ================= Impostazioni =================
+function Impostazioni({ sheetsUrl, onChangeSheetsUrl, onSyncNow, onLoadNow, syncStatus }) {
+  const [draft, setDraft] = useState(sheetsUrl || "");
+  useEffect(() => { setDraft(sheetsUrl || ""); }, [sheetsUrl]);
+  const save = () => onChangeSheetsUrl(draft.trim());
+  return (
+    <div>
+      <div style={card}>
+        <div style={{ fontWeight: 700, marginBottom: 8 }}>Google Sheet condiviso (multi-dispositivo)</div>
+        <div style={{ fontSize: 13, color: "#94a3b8", marginBottom: 12, lineHeight: 1.5 }}>
+          Incolla qui l'URL dell'"app web" di Google Apps Script collegata al tuo Google Sheet.
+          Una volta configurato, i tasti "Salva su Google Sheet" (nell'Attivazione e nella Scheda missione)
+          scrivono i dati sul foglio, così puoi lavorare da più computer o dal cellulare vedendo sempre
+          la stessa situazione. Vedi in fondo a questa pagina le istruzioni passo passo per crearlo.
+        </div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
+          <input
+            style={{ ...input, flex: 1, minWidth: 260, boxSizing: "border-box" }}
+            placeholder="https://script.google.com/macros/s/AKfycb.../exec"
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+          />
+          <button style={btnPrimary} onClick={save}><ArrowRight size={14} /> Salva URL</button>
+        </div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <button style={btnSecondary} onClick={onSyncNow}><Download size={14} style={{ transform: "rotate(180deg)" }} /> Sincronizza ora (invia)</button>
+          <button style={btnSecondary} onClick={onLoadNow}><Download size={14} /> Carica dati dal foglio</button>
+        </div>
+        {syncStatus && <div style={{ fontSize: 12, color: "#64748b", marginTop: 10 }}>{syncStatus}</div>}
+      </div>
+
+      <div style={{ ...card, marginTop: 16 }}>
+        <div style={{ fontWeight: 700, marginBottom: 8 }}>Come creare il foglio Google e collegarlo (una volta sola)</div>
+        <ol style={{ fontSize: 13, color: "#cbd5e1", lineHeight: 1.8, paddingLeft: 20, margin: 0 }}>
+          <li>Vai su <b>sheets.google.com</b> e crea un nuovo foglio vuoto. Chiamalo ad es. "IRIS dati".</li>
+          <li>Nel foglio, in alto, apri <b>Estensioni → Apps Script</b>.</li>
+          <li>Cancella il contenuto di esempio e incolla il codice che trovi nel file <code>google-apps-script.gs</code>
+            (te lo fornisco insieme a questi file: apri IRIS con GitHub Pages/Claude, poi copia tutto il contenuto).</li>
+          <li>Clicca il dischetto per salvare, poi <b>Esegui</b> una volta (Apps Script ti chiederà l'autorizzazione:
+            accetta, è il tuo stesso foglio).</li>
+          <li>Clicca <b>Deploy → Nuova implementazione</b>, tipo "App web". Come "Chi ha accesso" scegli
+            <b> Chiunque</b> (serve per farla funzionare da qualunque computer/telefono senza login Google ripetuto).</li>
+          <li>Copia l'URL che termina con <code>/exec</code> e incollalo qui sopra, poi premi "Salva URL".</li>
+          <li>Da questo momento i tasti "Salva su Google Sheet" scrivono nel foglio due schede (tab) create
+            automaticamente: <b>Storage</b> (dati grezzi dell'app, per il multi-dispositivo) e <b>Missioni</b>
+            (una riga leggibile per paziente, comoda da stampare/filtrare/esportare).</li>
+        </ol>
+      </div>
+    </div>
+  );
+}
+
 // ================= Attivazioni =================
 // Solo le vere richieste di soccorso (create dal wizard o manualmente come "attivazione"), non i
 // cambi di stato dei mezzi (quelli si vedono nel Brogliaccio). Sparisce da qui quando è conclusa
 // (es. dopo il trasporto in ospedale), ma resta comunque visibile nel Brogliaccio.
-function Attivazioni({ log, missions, resources, onNuova, onApriScheda, onConcludi }) {
+function Attivazioni({ log, missions, resources, onNuova, onApriScheda, onConcludi, onSync, syncStatus, sheetsConfigured }) {
   // Solo le vere richieste (non le righe automatiche di cambio stato) e non ancora concluse.
   const attivazioni = log.filter((l) => l.missionId && l.stato !== "conclusa" && !l.auto);
 
@@ -717,10 +927,14 @@ function Attivazioni({ log, missions, resources, onNuova, onApriScheda, onConclu
 
   return (
     <div>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14, flexWrap: "wrap", gap: 10 }}>
         <div style={{ fontSize: 13, color: "#94a3b8" }}>Avvia una nuova richiesta e assegna il codice colore d'invio.</div>
-        <button style={btnPrimary} onClick={onNuova}><Siren size={16} /> Nuova attivazione</button>
+        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+          <button style={btnSecondary} onClick={onSync} title={sheetsConfigured ? "" : "Configura l'URL in Impostazioni"}><Download size={14} style={{ transform: "rotate(180deg)" }} /> Salva su Google Sheet</button>
+          <button style={btnPrimary} onClick={onNuova}><Siren size={16} /> Nuova attivazione</button>
+        </div>
       </div>
+      {syncStatus && <div style={{ fontSize: 12, color: "#64748b", marginTop: -8, marginBottom: 14 }}>{syncStatus}</div>}
       {attivazioni.length === 0 && <div style={{ color: "#64748b", fontSize: 13, padding: 20, textAlign: "center" }}>Nessuna attivazione in corso.</div>}
       {attivazioni.map((l) => {
         const pronta = prontaPerScheda(l);
@@ -799,7 +1013,7 @@ function Brogliaccio({ log, onChange, resources, onApriScheda }) {
 }
 
 // ================= Missioni =================
-function Missioni({ missions, resources, onChange, openId, setOpenId }) {
+function Missioni({ missions, resources, onChange, openId, setOpenId, onAssignResource, onSync, syncStatus, sheetsConfigured }) {
   const open = missions.find((m) => m.id === openId);
   const updateMission = (id, patch) => onChange(missions.map((m) => (m.id === id ? { ...m, ...patch } : m)));
   const updatePaziente = (missionId, patientId, patch) => onChange(missions.map((m) => (m.id !== missionId ? m : { ...m, pazienti: m.pazienti.map((p) => (p.id === patientId ? { ...p, ...patch } : p)) })));
@@ -819,6 +1033,10 @@ function Missioni({ missions, resources, onChange, openId, setOpenId }) {
         onRemovePaziente={(pid) => removePaziente(open.id, pid)}
         onClose={() => setOpenId(null)}
         onDelete={() => remove(open.id)}
+        onAssignResource={onAssignResource}
+        onSync={() => onSync(open)}
+        syncStatus={syncStatus}
+        sheetsConfigured={sheetsConfigured}
       />
     );
   }
@@ -893,9 +1111,14 @@ function MultiToggle({ label: lbl, options, values, onChange }) {
 }
 function NumField({ label: lbl, value, onChange, placeholder, warn }) {
   return (
-    <div style={{ minWidth: 100, flex: 1 }}>
-      <div style={{ fontSize: 11, color: warn ? "#f87171" : "#64748b", marginBottom: 4 }}>{lbl}{warn ? " ⚠ fuori range" : ""}</div>
-      <input style={{ ...input, ...(warn ? { borderColor: "#dc2626", color: "#fca5a5" } : {}) }} value={value} placeholder={placeholder} onChange={(e) => onChange(e.target.value)} />
+    <div style={{ width: 84, flexShrink: 0, boxSizing: "border-box" }}>
+      <div style={{ fontSize: 11, color: warn ? "#f87171" : "#64748b", marginBottom: 4, whiteSpace: "nowrap" }}>{lbl}{warn ? " ⚠" : ""}</div>
+      <input
+        style={{ ...input, width: "100%", boxSizing: "border-box", textAlign: "center", ...(warn ? { borderColor: "#dc2626", color: "#fca5a5" } : {}) }}
+        value={value} placeholder={placeholder} maxLength={placeholder === "120/80" ? 7 : 6}
+        inputMode={placeholder === "120/80" ? "text" : "numeric"}
+        onChange={(e) => onChange(e.target.value)}
+      />
     </div>
   );
 }
@@ -978,33 +1201,53 @@ function LesioniPicker({ values, onChange }) {
 }
 
 // Risorse assegnate alla missione, con orari
-function RisorseMissione({ missionRisorse, allResources, onChange }) {
+function RisorseMissione({ missionRisorse, allResources, onChange, onAssignResource }) {
   const [toAdd, setToAdd] = useState("");
   const already = new Set(missionRisorse.map((r) => r.resourceId));
   const available = allResources.filter((r) => !already.has(r.id));
   const update = (resourceId, patch) => onChange(missionRisorse.map((r) => (r.resourceId === resourceId ? { ...r, ...patch } : r)));
   const remove = (resourceId) => onChange(missionRisorse.filter((r) => r.resourceId !== resourceId));
-  const add = () => { if (!toAdd) return; const r = allResources.find((x) => x.id === toAdd); if (!r) return; onChange([...missionRisorse, emptyRisorsaMissione(r)]); setToAdd(""); };
+  const add = () => {
+    if (!toAdd) return;
+    const r = allResources.find((x) => x.id === toAdd);
+    if (!r) return;
+    onChange([...missionRisorse, emptyRisorsaMissione(r)]);
+    setToAdd("");
+    // Il mezzo/risorsa appena agganciato alla missione passa automaticamente a "Diretto intervento"
+    // (se era ancora "Operativo"), esattamente come già avviene per le risorse scelte nel wizard iniziale.
+    if (onAssignResource) onAssignResource(r.id);
+  };
   return (
     <div>
       {missionRisorse.length === 0 && <div style={{ fontSize: 12, color: "#64748b", marginBottom: 10 }}>Nessuna risorsa assegnata.</div>}
-      {missionRisorse.map((r) => (
-        <div key={r.resourceId} style={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 8, padding: "10px 12px", marginBottom: 8 }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
-            <span style={{ fontWeight: 700 }}>{r.nome}</span>
-            <span style={{ fontSize: 11, color: "#64748b" }}>{r.tipo}</span>
-            <button style={{ ...btnGhost, marginLeft: "auto", color: "#f87171" }} onClick={() => remove(r.resourceId)}><Trash2 size={13} /></button>
+      {missionRisorse.map((r) => {
+        const risorsaCompleta = allResources.find((x) => x.id === r.resourceId);
+        const medici = risorsaCompleta && risorsaCompleta.medici ? risorsaCompleta.medici : [];
+        const isPostazione = TIPI_POSTAZIONE.includes(r.tipo);
+        return (
+          <div key={r.resourceId} style={{ background: "#0f172a", border: "1px solid #1e293b", borderRadius: 8, padding: "10px 12px", marginBottom: 8 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 8, flexWrap: "wrap" }}>
+              <span style={{ fontWeight: 700 }}>{r.nome}</span>
+              <span style={{ fontSize: 11, color: "#64748b" }}>{r.tipo}</span>
+              {isPostazione && medici.length > 0 && (
+                <select style={{ ...input, width: 190 }} value={r.medicoAssegnato || ""} onChange={(e) => update(r.resourceId, { medicoAssegnato: e.target.value })}>
+                  <option value="">Medico assegnato…</option>
+                  {medici.map((doc) => <option key={doc} value={doc}>{doc}</option>)}
+                </select>
+              )}
+              <button style={{ ...btnGhost, marginLeft: "auto", color: "#f87171" }} onClick={() => remove(r.resourceId)}><Trash2 size={13} /></button>
+            </div>
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+              <TimeField label="Attivazione" value={r.oraAttivazione} onChange={(v) => update(r.resourceId, { oraAttivazione: v })} />
+              <TimeField label="Partenza" value={r.oraPartenza} onChange={(v) => update(r.resourceId, { oraPartenza: v })} />
+              <TimeField label="Sul posto" value={r.oraSulPosto} onChange={(v) => update(r.resourceId, { oraSulPosto: v })} />
+              <TimeField label="Trasporto" value={r.oraTrasporto} onChange={(v) => update(r.resourceId, { oraTrasporto: v })} />
+              <TimeField label="Ospedale" value={r.oraOspedale} onChange={(v) => update(r.resourceId, { oraOspedale: v })} />
+              <TimeField label="Rientro operativo" value={r.oraRitorno} onChange={(v) => update(r.resourceId, { oraRitorno: v })} />
+            </div>
           </div>
-          <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-            <TimeField label="Attivazione" value={r.oraAttivazione} onChange={(v) => update(r.resourceId, { oraAttivazione: v })} />
-            <TimeField label="Partenza" value={r.oraPartenza} onChange={(v) => update(r.resourceId, { oraPartenza: v })} />
-            <TimeField label="Sul posto" value={r.oraSulPosto} onChange={(v) => update(r.resourceId, { oraSulPosto: v })} />
-            <TimeField label="Trasporto" value={r.oraTrasporto} onChange={(v) => update(r.resourceId, { oraTrasporto: v })} />
-            <TimeField label="Ospedale" value={r.oraOspedale} onChange={(v) => update(r.resourceId, { oraOspedale: v })} />
-            <TimeField label="Rientro operativo" value={r.oraRitorno} onChange={(v) => update(r.resourceId, { oraRitorno: v })} />
-          </div>
-        </div>
-      ))}
+        );
+      })}
       <div style={{ display: "flex", gap: 8 }}>
         <select style={{ ...input, flex: 1 }} value={toAdd} onChange={(e) => setToAdd(e.target.value)}>
           <option value="">Aggiungi risorsa alla missione…</option>
@@ -1017,7 +1260,7 @@ function RisorseMissione({ missionRisorse, allResources, onChange }) {
 }
 
 // ================= Scheda missione (multi-paziente) =================
-function SchedaMissione({ mission: m, resources, onUpdateMission, onUpdatePaziente, onAddPaziente, onRemovePaziente, onClose, onDelete }) {
+function SchedaMissione({ mission: m, resources, onUpdateMission, onUpdatePaziente, onAddPaziente, onRemovePaziente, onClose, onDelete, onAssignResource, onSync, syncStatus, sheetsConfigured }) {
   const [activeId, setActiveId] = useState(m.pazienti[0]?.id);
   const [confirmDelete, setConfirmDelete] = useState(false);
   useEffect(() => { if (!m.pazienti.find((p) => p.id === activeId)) setActiveId(m.pazienti[0]?.id); }, [m.pazienti]); // eslint-disable-line
@@ -1034,6 +1277,11 @@ function SchedaMissione({ mission: m, resources, onUpdateMission, onUpdatePazien
         <button style={{ ...btnGhost, color: "#f87171" }} onClick={() => setConfirmDelete(true)}><Trash2 size={14} /> Elimina</button>
       </div>
 
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14, flexWrap: "wrap" }}>
+        <button style={btnSecondary} onClick={onSync} title={sheetsConfigured ? "" : "Configura l'URL in Impostazioni"}><Download size={14} style={{ transform: "rotate(180deg)" }} /> Salva su Google Sheet</button>
+        {syncStatus && <span style={{ fontSize: 12, color: "#64748b" }}>{syncStatus}</span>}
+      </div>
+
       <Section title="Dati missione">
         <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
           <input style={{ ...input, width: 90 }} type="time" value={m.ora} onChange={(e) => onUpdateMission({ ora: e.target.value })} />
@@ -1043,7 +1291,7 @@ function SchedaMissione({ mission: m, resources, onUpdateMission, onUpdatePazien
       </Section>
 
       <Section title="Risorse assegnate alla missione">
-        <RisorseMissione missionRisorse={m.risorse} allResources={resources} onChange={(next) => onUpdateMission({ risorse: next })} />
+        <RisorseMissione missionRisorse={m.risorse} allResources={resources} onChange={(next) => onUpdateMission({ risorse: next })} onAssignResource={onAssignResource} />
       </Section>
 
       <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 16, marginBottom: -4, flexWrap: "wrap" }}>
@@ -1172,3 +1420,5 @@ const btnSecondary = { display: "flex", alignItems: "center", gap: 6, background
 const btnGhost = { display: "flex", alignItems: "center", gap: 6, background: "transparent", color: "#94a3b8", border: "none", borderRadius: 6, padding: "6px 10px", fontWeight: 600, fontSize: 12, cursor: "pointer" };
 const toggleBtn = { background: "#0f172a", border: "1px solid #1e293b", color: "#94a3b8", borderRadius: 6, padding: "7px 12px", fontSize: 12, fontWeight: 600, cursor: "pointer" };
 const activeToggle = { background: "#0c4a6e", color: "#7dd3fc", borderColor: "#38bdf8" };
+
+

@@ -34,17 +34,42 @@ vorrai aggiornare l'app, basterà ricaricare i nuovi file dallo stesso "Add file
 
 ## Importante: dove vengono salvati i dati
 Dentro Claude, IRIS salva risorse/attivazioni/schede missione nel sistema di Claude.
-Una volta pubblicato online, l'app salva invece i dati nel **localStorage del browser**:
-- i dati restano solo su quel computer/browser specifico (se apri il sito da un altro
-  telefono o computer, non li vedrai — non è un archivio condiviso tra gli operatori);
-- se cancelli la cache/i dati del browser, o usi la navigazione in incognito, i dati si perdono;
-- va benissimo per usarlo da un unico PC/tablet in sala radio, ma **non è adatto** a un
-  uso condiviso da più postazioni contemporaneamente senza un backend/database vero.
+Una volta pubblicato online, l'app salva di base i dati nel **localStorage del browser**
+(restano solo su quel computer/browser). Se vuoi che più operatori/computer/telefoni
+vedano **la stessa situazione in tempo reale**, collega IRIS a un Google Sheet: vedi la
+sezione qui sotto.
 
-Se in futuro vuoi un archivio condiviso tra più operatori/dispositivi (es. tutti vedono
-le stesse schede missione in tempo reale), serve un piccolo database online (es. Supabase
-o Firebase, gratuiti per iniziare) al posto del localStorage — se ti interessa, possiamo
-predisporlo.
+## Sincronizzare IRIS con un Google Sheet (multi-dispositivo)
+Ora IRIS ha una scheda **Impostazioni** dove incollare l'indirizzo di un piccolo
+"programmino" (Google Apps Script) che fa da tramite fra l'app e un tuo foglio Google.
+Non serve installare nulla: si scrive direttamente nel sito di Google Sheets.
+
+1. Vai su **sheets.google.com** e crea un foglio nuovo, vuoto. Chiamalo ad es. "IRIS dati".
+2. Nel foglio, in alto, apri **Estensioni → Apps Script**.
+3. Cancella il codice di esempio e incolla **tutto** il contenuto del file
+   `google-apps-script.gs` (incluso in questa cartella).
+4. Clicca l'icona del dischetto per salvare il progetto (dagli un nome se richiesto).
+5. Clicca **Esegui** una volta sola sulla funzione `doGet` (in alto): Google chiederà
+   un'autorizzazione, è il tuo stesso foglio quindi puoi accettare tranquillamente
+   ("Avanzate" → "Vai al progetto (non sicuro)" è normale per script personali).
+6. Clicca **Deploy → Nuova implementazione**. Come tipo scegli **App web**. In
+   "Chi ha accesso" scegli **Chiunque** (serve per usarla da qualsiasi computer/telefono
+   senza dover accedere ogni volta con un account Google).
+7. Copia l'URL che termina con **/exec**.
+8. Apri IRIS, vai nella scheda **Impostazioni**, incolla l'URL nel campo e premi
+   "Salva URL".
+
+Da quel momento, i pulsanti **"Salva su Google Sheet"** (nell'elenco Attivazioni e dentro
+ogni Scheda missione) scrivono i dati sul foglio, in due schede (tab) create in automatico:
+- **Storage** — copia grezza di tutti i dati dell'app (non modificarla a mano, serve solo
+  per far vedere agli altri dispositivi la stessa situazione quando premono "Carica dati
+  dal foglio" nelle Impostazioni);
+- **Missioni** — una riga leggibile per ciascun paziente (numero missione, orario, luogo,
+  mezzi assegnati, parametri vitali, ecc.), pensata per essere letta, stampata o filtrata
+  direttamente su Google Sheets.
+
+Se in futuro ti serve rigenerare l'URL o cambiare foglio, ripeti i passaggi 6-8 con un
+nuovo Google Sheet: bastano pochi minuti.
 
 ## Nota sul dominio
 Se in futuro vuoi un indirizzo personalizzato (es. `iris.tuosito.it`) invece di
