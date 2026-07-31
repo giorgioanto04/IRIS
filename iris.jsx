@@ -396,15 +396,27 @@ export default function App() {
     await persistResources(nextResources);
 
     const logEntry = { id: uid(), ora, mezzo: r.nome, luogo: "", tipoEvento: `Cambio stato: ${statoLabel}`, note: "", stato: "conclusa", missionId: null, numero: null, codiceInvio: "", creato: Date.now() };
-    await persistLog([logEntry, ...log]);
 
+    let activeMission = null;
     if (def.campo) {
-      const activeMission = findActiveMissionForResource(missions, log, resourceId);
+      activeMission = findActiveMissionForResource(missions, log, resourceId);
       if (activeMission) {
         const nextMissions = missions.map((m) => (m.id !== activeMission.id ? m : { ...m, risorse: m.risorse.map((rr) => (rr.resourceId === resourceId ? { ...rr, [def.campo]: ora } : rr)) }));
         await persistMissions(nextMissions);
       }
     }
+
+    // Arrivo in ospedale = trasporto concluso: la richiesta esce dalla lista Attivazioni
+    // (resta comunque visibile nel Brogliaccio, dove è stata appena registrata la riga di cambio stato).
+    const nextLog = [logEntry, ...log].map((l) => (
+      statoId === "in_ospedale" && activeMission && l.missionId === activeMission.id ? { ...l, stato: "conclusa" } : l
+    ));
+    await persistLog(nextLog);
+  };
+
+  // Chiude manualmente un'attivazione dalla scheda "Attivazioni": sparisce da lì ma resta nel Brogliaccio.
+  const concludiAttivazione = async (logId) => {
+    await persistLog(log.map((l) => (l.id === logId ? { ...l, stato: "conclusa" } : l)));
   };
 
   const handleWizardComplete = async ({ answers, luogo, motivo, codiceInvio, risorseIds }) => {
@@ -457,7 +469,7 @@ export default function App() {
           <ResourceStatusBar resources={resources} onSetStato={setResourceStato} onExportBrogliaccio={() => exportBrogliaccioCsv(log)} onExportMissioni={() => exportMissioniCsv(missions)} />
           <div className="iris-main">
             {tab === "risorse" && <Risorse resources={resources} onChange={persistResources} />}
-            {tab === "attivazioni" && !wizardOpen && <Attivazioni log={log} onNuova={() => setWizardOpen(true)} onApriScheda={apriSchedaDaLog} />}
+            {tab === "attivazioni" && !wizardOpen && <Attivazioni log={log} onNuova={() => setWizardOpen(true)} onApriScheda={apriSchedaDaLog} onConcludi={concludiAttivazione} />}
             {tab === "attivazioni" && wizardOpen && <Wizard resources={resources} onCancel={() => setWizardOpen(false)} onComplete={handleWizardComplete} />}
             {tab === "brogliaccio" && <Brogliaccio log={log} onChange={persistLog} resources={resources} onApriScheda={apriSchedaDaLog} />}
             {tab === "missioni" && <Missioni missions={missions} resources={resources} onChange={persistMissions} openId={openMissionId} setOpenId={setOpenMissionId} />}
@@ -665,15 +677,19 @@ function Risorse({ resources, onChange }) {
 }
 
 // ================= Attivazioni =================
-function Attivazioni({ log, onNuova, onApriScheda }) {
+// Solo le vere richieste di soccorso (create dal wizard o manualmente come "attivazione"), non i
+// cambi di stato dei mezzi (quelli si vedono nel Brogliaccio). Sparisce da qui quando è conclusa
+// (es. dopo il trasporto in ospedale), ma resta comunque visibile nel Brogliaccio.
+function Attivazioni({ log, onNuova, onApriScheda, onConcludi }) {
+  const attivazioni = log.filter((l) => l.missionId && l.stato !== "conclusa");
   return (
     <div>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
         <div style={{ fontSize: 13, color: "#94a3b8" }}>Avvia una nuova richiesta e assegna il codice colore d'invio.</div>
         <button style={btnPrimary} onClick={onNuova}><Siren size={16} /> Nuova attivazione</button>
       </div>
-      {log.length === 0 && <div style={{ color: "#64748b", fontSize: 13, padding: 20, textAlign: "center" }}>Nessuna attivazione registrata.</div>}
-      {log.map((l) => (
+      {attivazioni.length === 0 && <div style={{ color: "#64748b", fontSize: 13, padding: 20, textAlign: "center" }}>Nessuna attivazione in corso.</div>}
+      {attivazioni.map((l) => (
         <div key={l.id} style={{ ...card, padding: "12px 14px", marginBottom: 8, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
           <span style={{ fontFamily: "monospace", color: "#38bdf8", fontWeight: 700 }}><Clock size={12} style={{ marginRight: 4, verticalAlign: -1 }} />{l.ora}</span>
           {l.numero && <span style={{ fontFamily: "monospace", fontSize: 11, color: "#64748b", background: "#0f172a", padding: "2px 6px", borderRadius: 4 }}>N. {l.numero}</span>}
@@ -681,7 +697,10 @@ function Attivazioni({ log, onNuova, onApriScheda }) {
           {l.luogo && <span style={{ color: "#64748b", fontSize: 13 }}>@ {l.luogo}</span>}
           <span style={{ color: "#94a3b8", fontSize: 13 }}>{l.mezzo}</span>
           {l.codiceInvio && <Badge bg={COLORI[l.codiceInvio].bg} color="#0b1220" text={COLORI[l.codiceInvio].label} />}
-          <button style={{ ...btnSecondary, marginLeft: "auto" }} onClick={() => onApriScheda(l)}>{l.missionId ? "Apri scheda missione" : "Crea scheda missione"}</button>
+          <span style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
+            <button style={btnSecondary} onClick={() => onApriScheda(l)}>Apri scheda missione</button>
+            <button style={btnGhost} onClick={() => onConcludi(l.id)}>Concludi</button>
+          </span>
         </div>
       ))}
     </div>
