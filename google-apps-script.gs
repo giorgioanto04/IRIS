@@ -96,6 +96,7 @@ function saveKv_(key, value) {
   var sh = getSheet_(STORAGE_SHEET, ["chiave", "valore", "aggiornato"]);
   var row = findRowByKey_(sh, key);
   var now = new Date();
+  var updated = now.getTime();
   var json = JSON.stringify(value);
   if (row === -1) {
     sh.appendRow([key, json, now]);
@@ -103,7 +104,7 @@ function saveKv_(key, value) {
     sh.getRange(row, 2).setValue(json);
     sh.getRange(row, 3).setValue(now);
   }
-  return jsonOut_({ ok: true });
+  return jsonOut_({ ok: true, updated: updated });
 }
 
 // Nomi di scheda (tab) validi in Google Sheets: niente : \ / ? * [ ], max 100 caratteri.

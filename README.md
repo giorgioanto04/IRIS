@@ -59,14 +59,18 @@ Non serve installare nulla: si scrive direttamente nel sito di Google Sheets.
 8. Apri IRIS, vai nella scheda **Impostazioni**, incolla l'URL nel campo e premi
    "Salva URL".
 
-Da quel momento, i pulsanti **"Salva su Google Sheet"** (nell'elenco Attivazioni e dentro
-ogni Scheda missione) scrivono i dati sul foglio, in due schede (tab) create in automatico:
-- **Storage** — copia grezza di tutti i dati dell'app (non modificarla a mano, serve solo
-  per far vedere agli altri dispositivi la stessa situazione quando premono "Carica dati
-  dal foglio" nelle Impostazioni);
+Da quel momento IRIS sincronizza automaticamente ogni modifica con Google Sheets e controlla
+il foglio ogni secondo per ricevere gli aggiornamenti dagli altri dispositivi. I pulsanti
+manuali restano disponibili per una sincronizzazione immediata. I dati vengono scritti in due
+schede (tab) create in automatico:
+- **Storage** — copia grezza di tutti i dati dell'app (non modificarla a mano, serve per
+  sincronizzare automaticamente gli altri dispositivi);
 - **Missioni** — una riga leggibile per ciascun paziente (numero missione, orario, luogo,
   mezzi assegnati, parametri vitali, ecc.), pensata per essere letta, stampata o filtrata
-  direttamente su Google Sheets.
+direttamente su Google Sheets.
+
+Nella barra superiore IRIS mostra un indicatore: verde quando il collegamento è attivo,
+giallo durante la sincronizzazione e rosso se il foglio non è raggiungibile.
 
 Se in futuro ti serve rigenerare l'URL o cambiare foglio, ripeti i passaggi 6-8 con un
 nuovo Google Sheet: bastano pochi minuti.
