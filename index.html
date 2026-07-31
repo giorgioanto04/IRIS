@@ -93,6 +93,15 @@ const RESPIRO_OPZ = [["normale", "Normale"], ["difficoltoso", "Difficoltoso"], [
 const uid = () => Math.random().toString(36).slice(2, 10);
 const nowTime = () => new Date().toTimeString().slice(0, 5);
 
+// Unisce l'elenco eventi locale con quello letto dal Google Sheet: eventi presenti in uno solo dei
+// due elenchi vengono aggiunti, quelli presenti in entrambi restano una sola volta (per id).
+function mergeEvents_(local, remote) {
+  const byId = new Map();
+  (remote || []).forEach((e) => byId.set(e.id, e));
+  (local || []).forEach((e) => { if (!byId.has(e.id)) byId.set(e.id, e); });
+  return Array.from(byId.values()).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+}
+
 function formatMissionNumber(eventDateStr, seq) {
   const d = eventDateStr ? new Date(eventDateStr) : new Date();
   const yy = String(d.getFullYear()).slice(-2);
@@ -418,31 +427,58 @@ function App() {
   const [syncStatus, setSyncStatus] = useState(""); // messaggio di stato sincronizzazione mostrato accanto ai tasti "Salva"
 
   useEffect(() => { (async () => {
-    setEvents(await loadKey("events", []));
+    const localEvents = await loadKey("events", []);
+    const url = await loadKey("sheetsUrl", "");
     setTipiRisorsa(await loadKey("tipiRisorsa", TIPI_RISORSA_BASE));
-    setSheetsUrl(await loadKey("sheetsUrl", ""));
+    setSheetsUrl(url);
+    let finalEvents = localEvents;
+    if (url) {
+      try {
+        const remoteEvents = await sheetsGet(url, "events");
+        if (remoteEvents) finalEvents = mergeEvents_(localEvents, remoteEvents);
+      } catch (err) { console.error("Caricamento eventi da Google Sheet fallito:", err); }
+    }
+    setEvents(finalEvents);
+    await saveKey("events", finalEvents);
     setLoading(false);
   })(); }, []);
 
   const persistTipiRisorsa = useCallback(async (next) => { setTipiRisorsa(next); await saveKey("tipiRisorsa", next); }, []);
   const persistSheetsUrl = useCallback(async (next) => { setSheetsUrl(next); await saveKey("sheetsUrl", next); }, []);
 
+  // Ricarica manualmente l'elenco eventi dal Google Sheet (pulsante nella schermata iniziale):
+  // utile per far comparire sul tablet un evento appena creato sul PC (e viceversa).
+  const loadEventsFromSheet = useCallback(async () => {
+    if (!sheetsUrl) { setSyncStatus("Nessun URL Google Sheet configurato (vedi Impostazioni)."); return; }
+    setSyncStatus("Caricamento elenco eventi…");
+    try {
+      const remoteEvents = await sheetsGet(sheetsUrl, "events");
+      const merged = mergeEvents_(events, remoteEvents || []);
+      await persistEvents(merged);
+      setSyncStatus("Elenco eventi aggiornato ✓ (" + nowTime() + ")");
+    } catch (err) {
+      console.error("Errore caricamento eventi:", err);
+      setSyncStatus("Errore nel caricamento: controlla l'URL nelle Impostazioni.");
+    }
+  }, [sheetsUrl, events]);
+
   // Sincronizzazione manuale con Google Sheet: invia lo stato attuale (risorse, log, missioni)
-  // sia come "riga leggibile" (foglio Missioni) sia come copia grezza per il multi-dispositivo (foglio Storage).
+  // sia come "riga leggibile" (foglio dedicato all'evento) sia come copia grezza per il multi-dispositivo (foglio Storage).
   const syncToSheet = useCallback(async (mission) => {
     if (!sheetsUrl) { setSyncStatus("Nessun URL Google Sheet configurato (vedi Impostazioni)."); return; }
     setSyncStatus("Salvataggio in corso…");
     try {
+      const eventName = (events.find((e) => e.id === currentEventId) || {}).name || currentEventId;
       await sheetsPost(sheetsUrl, { action: "kv", key: `resources:${currentEventId}`, value: resources });
       await sheetsPost(sheetsUrl, { action: "kv", key: `log:${currentEventId}`, value: log });
       await sheetsPost(sheetsUrl, { action: "kv", key: `missions:${currentEventId}`, value: missions });
-      if (mission) await sheetsPost(sheetsUrl, { action: "saveMission", mission });
+      if (mission) await sheetsPost(sheetsUrl, { action: "saveMission", mission, eventName });
       setSyncStatus("Salvato su Google Sheet ✓ (" + nowTime() + ")");
     } catch (err) {
       console.error("Errore sincronizzazione Google Sheet:", err);
       setSyncStatus("Errore di sincronizzazione: controlla l'URL nelle Impostazioni.");
     }
-  }, [sheetsUrl, currentEventId, resources, log, missions]);
+  }, [sheetsUrl, currentEventId, resources, log, missions, events]);
 
   const loadFromSheet = useCallback(async () => {
     if (!sheetsUrl) { setSyncStatus("Nessun URL Google Sheet configurato (vedi Impostazioni)."); return; }
@@ -491,14 +527,15 @@ function App() {
     setMissions(next);
     await saveKey(`missions:${currentEventId}`, next);
     autoSyncKv(`missions:${currentEventId}`, next);
-    // Ogni missione modificata viene scritta anche nella scheda "Missioni" (riga leggibile per paziente),
-    // così il foglio resta sempre allineato senza dover premere "Salva su Google Sheet" a parte.
+    // Ogni missione modificata viene scritta anche in un foglio dedicato all'evento (una scheda/tab per
+    // evento, così ogni serata ha la propria pagina leggibile), senza dover premere un tasto a parte.
     if (sheetsUrl) {
+      const eventName = (events.find((e) => e.id === currentEventId) || {}).name || currentEventId;
       next.forEach((m) => {
-        sheetsPost(sheetsUrl, { action: "saveMission", mission: m }).catch((err) => console.error("Auto-sync missione:", err));
+        sheetsPost(sheetsUrl, { action: "saveMission", mission: m, eventName }).catch((err) => console.error("Auto-sync missione:", err));
       });
     }
-  }, [currentEventId, autoSyncKv, sheetsUrl]);
+  }, [currentEventId, autoSyncKv, sheetsUrl, events]);
 
   const currentEvent = events.find((e) => e.id === currentEventId);
 
@@ -610,7 +647,10 @@ function App() {
       `}</style>
       <TopBar currentEvent={currentEvent} tab={tab} setTab={setTab} onNuovaSerata={() => setCurrentEventId(null)} inEvent={!!currentEventId} />
       {!currentEventId ? (
-        <EventoSetup events={events} onCreate={persistEvents} onSelect={setCurrentEventId} onDelete={persistEvents} />
+        <EventoSetup
+          events={events} onCreate={persistEvents} onSelect={setCurrentEventId} onDelete={persistEvents}
+          onLoadEventsFromSheet={loadEventsFromSheet} sheetsConfigured={!!sheetsUrl} syncStatus={syncStatus}
+        />
       ) : (
         <div className="iris-body">
           <ResourceStatusBar resources={resources} missions={missions} onSetStato={setResourceStato} onExportBrogliaccio={() => exportBrogliaccioCsv(log)} onExportMissioni={() => exportMissioniCsv(missions)} />
@@ -655,7 +695,7 @@ function TopBar({ currentEvent, tab, setTab, onNuovaSerata, inEvent }) {
             </select>
             <ChevronDown size={14} style={{ position: "absolute", right: 9, top: 10, pointerEvents: "none", color: "#64748b" }} />
           </div>
-          <button onClick={onNuovaSerata} style={btnGhost}>NUOVO EVENTO</button>
+          <button onClick={onNuovaSerata} style={btnGhost}>Nuova serata</button>
         </div>
       )}
     </div>
@@ -760,7 +800,7 @@ function ResourceStatusCard({ resource, missions, onSetStato }) {
 }
 
 // ================= Setup evento =================
-function EventoSetup({ events, onCreate, onSelect, onDelete }) {
+function EventoSetup({ events, onCreate, onSelect, onDelete, onLoadEventsFromSheet, sheetsConfigured, syncStatus }) {
   const [name, setName] = useState(""); const [date, setDate] = useState(""); const [location, setLocation] = useState("");
   const create = () => {
     if (!name.trim()) return;
@@ -769,8 +809,16 @@ function EventoSetup({ events, onCreate, onSelect, onDelete }) {
   };
   return (
     <div style={{ maxWidth: 640, margin: "40px auto", padding: "0 20px" }}>
-      <h1 style={{ fontSize: 22, fontWeight: 700, marginBottom: 4 }}>Nuova serata / evento</h1>
-      <p style={{ color: "#94a3b8", fontSize: 14, marginBottom: 24 }}>Crea lo "sheet" della serata: da qui si aprono risorse, attivazioni, brogliaccio e schede missione.</p>
+      <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 10 }}>
+        <div>
+          <h1 style={{ fontSize: 22, fontWeight: 700, marginBottom: 4 }}>Nuova serata / evento</h1>
+          <p style={{ color: "#94a3b8", fontSize: 14, marginBottom: 12 }}>Crea lo "sheet" della serata: da qui si aprono risorse, attivazioni, brogliaccio e schede missione.</p>
+        </div>
+        <button style={btnSecondary} onClick={onLoadEventsFromSheet} title={sheetsConfigured ? "Aggiorna l'elenco leggendo gli eventi creati da altri dispositivi" : "Configura l'URL in Impostazioni"}>
+          <Download size={14} /> Aggiorna da Google Sheet
+        </button>
+      </div>
+      {syncStatus && <div style={{ fontSize: 12, color: "#64748b", marginBottom: 16 }}>{syncStatus}</div>}
       <div style={card}>
         <label style={label}>Nome evento</label>
         <input style={input} value={name} onChange={(e) => setName(e.target.value)} placeholder="Es. Concerto Piazza Duomo" />
@@ -956,9 +1004,13 @@ function Impostazioni({ sheetsUrl, onChangeSheetsUrl, onSyncNow, onLoadNow, sync
           <li>Clicca <b>Deploy → Nuova implementazione</b>, tipo "App web". Come "Chi ha accesso" scegli
             <b> Chiunque</b> (serve per farla funzionare da qualunque computer/telefono senza login Google ripetuto).</li>
           <li>Copia l'URL che termina con <code>/exec</code> e incollalo qui sopra, poi premi "Salva URL".</li>
-          <li>Da questo momento i tasti "Salva su Google Sheet" scrivono nel foglio due schede (tab) create
-            automaticamente: <b>Storage</b> (dati grezzi dell'app, per il multi-dispositivo) e <b>Missioni</b>
-            (una riga leggibile per paziente, comoda da stampare/filtrare/esportare).</li>
+          <li>Da questo momento tutto si sincronizza <b>in automatico</b> ad ogni azione (non serve più
+            premere alcun tasto): l'elenco eventi e i dati di ogni evento vengono scritti nella scheda
+            (tab) <b>Storage</b>, mentre per ogni evento/serata che crei viene generata in automatico
+            una scheda dedicata (es. <b>"Missioni - Concerto Piazza Duomo"</b>) con una riga leggibile
+            per ciascun paziente, comoda da stampare/filtrare/esportare. Nella schermata iniziale trovi
+            anche il tasto "Aggiorna da Google Sheet" per far comparire su un tablet gli eventi creati
+            nel frattempo da un altro computer.</li>
         </ol>
       </div>
     </div>
