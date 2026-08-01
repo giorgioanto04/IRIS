@@ -752,7 +752,8 @@ function App() {
       {!currentEventId ? (
         <EventoSetup
           events={events} onCreate={persistEvents} onSelect={setCurrentEventId} onDelete={persistEvents}
-          onLoadEventsFromSheet={loadEventsFromSheet} sheetsConfigured={!!sheetsUrl} syncStatus={syncStatus}
+          onLoadEventsFromSheet={loadEventsFromSheet} sheetsUrl={sheetsUrl} onChangeSheetsUrl={persistSheetsUrl}
+          connectionStatus={connectionStatus} sheetsConfigured={!!sheetsUrl} syncStatus={syncStatus}
         />
       ) : (
         <div className="iris-body">
@@ -761,7 +762,7 @@ function App() {
             {tab === "risorse" && <Risorse resources={resources} onChange={persistResources} tipiRisorsa={tipiRisorsa} onChangeTipi={persistTipiRisorsa} />}
             {tab === "attivazioni" && !wizardOpen && <Attivazioni log={log} missions={missions} resources={resources} onNuova={() => setWizardOpen(true)} onApriScheda={apriSchedaDaLog} onConcludi={concludiAttivazione} onSync={() => syncToSheet(null)} syncStatus={syncStatus} sheetsConfigured={!!sheetsUrl} />}
             {tab === "attivazioni" && wizardOpen && <Wizard resources={resources} onCancel={() => setWizardOpen(false)} onComplete={handleWizardComplete} />}
-            {tab === "brogliaccio" && <Brogliaccio log={log} onChange={persistLog} resources={resources} missions={missions} onApriScheda={apriSchedaDaLog} />}
+            {tab === "brogliaccio" && <Brogliaccio log={log} onChange={persistLog} resources={resources} onApriScheda={apriSchedaDaLog} />}
             {tab === "missioni" && <Missioni missions={missions} resources={resources} log={log} onChange={persistMissions} openId={openMissionId} setOpenId={setOpenMissionId} onAssignResource={assegnaRisorsaAMissione} onSync={syncToSheet} syncStatus={syncStatus} sheetsConfigured={!!sheetsUrl} />}
             {tab === "impostazioni" && <Impostazioni sheetsUrl={sheetsUrl} onChangeSheetsUrl={persistSheetsUrl} onSyncNow={() => syncToSheet(null)} onLoadNow={loadFromSheet} syncStatus={syncStatus} />}
           </div>
@@ -907,25 +908,53 @@ function ResourceStatusCard({ resource, missions, onSetStato }) {
 }
 
 // ================= Setup evento =================
-function EventoSetup({ events, onCreate, onSelect, onDelete, onLoadEventsFromSheet, sheetsConfigured, syncStatus }) {
+function EventoSetup({ events, onCreate, onSelect, onDelete, onLoadEventsFromSheet, sheetsUrl, onChangeSheetsUrl, connectionStatus, sheetsConfigured, syncStatus }) {
   const [name, setName] = useState(""); const [date, setDate] = useState(""); const [location, setLocation] = useState("");
+  const [urlDraft, setUrlDraft] = useState(sheetsUrl || "");
+  useEffect(() => { setUrlDraft(sheetsUrl || ""); }, [sheetsUrl]);
   const create = () => {
     if (!name.trim()) return;
     const ev = { id: uid(), name: name.trim(), date: date || new Date().toISOString().slice(0, 10), location: location.trim(), createdAt: Date.now() };
     onCreate([ev, ...events]); setName(""); setDate(""); setLocation(""); onSelect(ev.id);
   };
+  const saveUrl = async () => {
+    await onChangeSheetsUrl(urlDraft.trim());
+    if (urlDraft.trim()) onLoadEventsFromSheet();
+  };
+  const dotColor = { connected: "#22c55e", syncing: "#eab308", error: "#ef4444", offline: "#64748b" }[connectionStatus] || "#64748b";
   return (
     <div style={{ maxWidth: 640, margin: "40px auto", padding: "0 20px" }}>
+      {/* Collegamento condiviso: va inserito qui, PRIMA di creare/scegliere un evento, così questo
+          dispositivo vede fin da subito gli eventi creati da tutti gli altri (come un accesso). */}
+      <div style={{ ...card, marginBottom: 20, borderColor: sheetsConfigured ? "#1e293b" : "#78350f" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+          <span style={{ width: 9, height: 9, borderRadius: "50%", background: dotColor, boxShadow: connectionStatus === "connected" ? "0 0 8px #22c55e" : "none", flexShrink: 0 }} />
+          <div style={{ fontWeight: 700 }}>Collegamento condiviso</div>
+        </div>
+        <div style={{ fontSize: 13, color: "#94a3b8", marginBottom: 10, lineHeight: 1.5 }}>
+          Incolla qui il link del foglio condiviso (lo stesso su tutti i dispositivi) per vedere subito
+          gli eventi creati da chiunque altro. Senza questo collegamento, gli eventi restano visibili
+          solo su questo dispositivo.
+        </div>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <input
+            style={{ ...input, flex: 1, minWidth: 220, boxSizing: "border-box" }}
+            placeholder="https://script.google.com/macros/s/AKfycb.../exec"
+            value={urlDraft}
+            onChange={(e) => setUrlDraft(e.target.value)}
+          />
+          <button style={btnPrimary} onClick={saveUrl}><ArrowRight size={14} /> Collega</button>
+          {sheetsConfigured && <button style={btnSecondary} onClick={onLoadEventsFromSheet}><Download size={14} /> Aggiorna ora</button>}
+        </div>
+        {syncStatus && <div style={{ fontSize: 12, color: "#64748b", marginTop: 8 }}>{syncStatus}</div>}
+        {!sheetsConfigured && <div style={{ fontSize: 11.5, color: "#fcd34d", marginTop: 8 }}>Non collegato: chi non incolla lo stesso link non vedrà gli eventi altrui. Le istruzioni per creare il link si trovano nella scheda "Impostazioni" una volta aperto un evento.</div>}
+      </div>
       <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 10 }}>
         <div>
           <h1 style={{ fontSize: 22, fontWeight: 700, marginBottom: 4 }}>Nuova serata / evento</h1>
           <p style={{ color: "#94a3b8", fontSize: 14, marginBottom: 12 }}>Crea lo "sheet" della serata: da qui si aprono risorse, attivazioni, brogliaccio e schede missione.</p>
         </div>
-        <button style={btnSecondary} onClick={onLoadEventsFromSheet} title={sheetsConfigured ? "Aggiorna l'elenco leggendo gli eventi creati da altri dispositivi" : "Configura l'URL in Impostazioni"}>
-          <Download size={14} /> Aggiorna da Google Sheet
-        </button>
       </div>
-      {syncStatus && <div style={{ fontSize: 12, color: "#64748b", marginBottom: 16 }}>{syncStatus}</div>}
       <div style={card}>
         <label style={label}>Nome evento</label>
         <input style={input} value={name} onChange={(e) => setName(e.target.value)} placeholder="Es. Concerto Piazza Duomo" />
@@ -1183,25 +1212,25 @@ function Attivazioni({ log, missions, resources, onNuova, onApriScheda, onConclu
 }
 
 // ================= Brogliaccio =================
-function Brogliaccio({ log, onChange, resources, missions, onApriScheda }) {
+function Brogliaccio({ log, onChange, resources, onApriScheda }) {
   const [form, setForm] = useState({ ora: nowTime(), mezzo: "", tipoEvento: "", luogo: "", note: "" });
   const add = () => { onChange([{ id: uid(), ...form, stato: "in corso", missionId: null, numero: null, codiceInvio: "", creato: Date.now() }, ...log]); setForm({ ora: nowTime(), mezzo: "", tipoEvento: "", luogo: "", note: "" }); };
   const chiudi = (id) => onChange(log.map((l) => (l.id === id ? { ...l, stato: "conclusa" } : l)));
   const remove = (id) => onChange(log.filter((l) => l.id !== id));
   const setOra = (id, ora) => onChange(log.map((l) => (l.id === id ? { ...l, ora } : l)));
 
-  // Stessa regola di "Attivazioni": la scheda missione (dati paziente) si apre solo quando almeno
-  // un mezzo assegnato è "Sull'intervento". Se la riga non è ancora agganciata a una missione, o non
-  // ha mezzi assegnati, non c'è nulla da verificare e si può aprire/creare liberamente.
+  // Il tasto "Apri scheda missione" compare SOLO quando il mezzo di questa riga risulta
+  // esattamente "Sull'intervento": in ogni altro stato (Diretto intervento, Diretto ospedale,
+  // In ospedale, Operativo, ecc.) non deve comparire alcun tasto, non solo essere disabilitato.
   const prontaPerScheda = (l) => {
-    if (!l.missionId) return true;
-    const m = (missions || []).find((mm) => mm.id === l.missionId);
-    if (!m || !m.risorse || m.risorse.length === 0) return true;
-    return m.risorse.some((rr) => {
-      const res = resources.find((x) => x.id === rr.resourceId);
-      return res && res.stato === "sul_intervento";
-    });
+    if (!l.mezzo) return false;
+    const res = resources.find((x) => x.nome === l.mezzo);
+    return !!res && res.stato === "sul_intervento";
   };
+
+  // Ordine cronologico: modificando manualmente l'orario di una voce, questa deve spostarsi
+  // nella posizione corretta rispetto alle altre, non restare ferma dov'era stata inserita.
+  const displayLog = [...log].sort((a, b) => (b.ora || "").localeCompare(a.ora || "") || (b.creato || 0) - (a.creato || 0));
   return (
     <div>
       <div style={card}>
@@ -1220,7 +1249,7 @@ function Brogliaccio({ log, onChange, resources, missions, onApriScheda }) {
       </div>
       <div style={{ marginTop: 16 }}>
         {log.length === 0 && <div style={{ color: "#64748b", fontSize: 13, padding: 20, textAlign: "center" }}>Nessuna voce registrata.</div>}
-        {log.map((l) => {
+        {displayLog.map((l) => {
           const pronta = prontaPerScheda(l);
           return (
           <div key={l.id} style={{ ...card, padding: "12px 14px", marginBottom: 8 }}>
@@ -1244,14 +1273,11 @@ function Brogliaccio({ log, onChange, resources, missions, onApriScheda }) {
             </div>
             {l.note && <div style={{ fontSize: 12, color: "#64748b", marginTop: 4 }}>{l.note}</div>}
             <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-              <button
-                style={{ ...btnSecondary, ...(pronta ? {} : { opacity: 0.4, cursor: "not-allowed", borderColor: "#334155", color: "#64748b" }) }}
-                disabled={!pronta}
-                title={pronta ? "" : "Disponibile quando il mezzo è sull'intervento"}
-                onClick={() => pronta && onApriScheda(l)}
-              >
-                {l.missionId ? "Apri scheda missione" : "+ Apri scheda missione"}
-              </button>
+              {pronta && (
+                <button style={btnSecondary} onClick={() => onApriScheda(l)}>
+                  {l.missionId ? "Apri scheda missione" : "+ Apri scheda missione"}
+                </button>
+              )}
               {l.stato !== "conclusa" && <button style={btnGhost} onClick={() => chiudi(l.id)}>Chiudi</button>}
               <button style={{ ...btnGhost, color: "#f87171" }} onClick={() => remove(l.id)}><Trash2 size={13} /></button>
             </div>
