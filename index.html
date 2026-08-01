@@ -588,8 +588,14 @@ function App() {
           } else if (entry.updated <= (remoteTs.current[key] || 0)) continue;
           remoteTs.current[key] = entry.updated;
           if (key === "events") {
-            setEvents(entry.value);
-            await saveKey("events", entry.value);
+            // Unione (non sovrascrittura secca) con l'elenco locale: se un altro dispositivo ha creato
+            // un evento nuovo, va aggiunto qui anche se nel frattempo questo dispositivo ne ha creato
+            // un altro non ancora sincronizzato, altrimenti l'ultimo che scrive "vince" e l'altro sparisce.
+            setEvents((prevEvents) => {
+              const merged = mergeEvents_(prevEvents, entry.value);
+              saveKey("events", merged);
+              return merged;
+            });
           } else if (key === `resources:${currentEventId}`) {
             setResources(entry.value);
             await saveKey(key, entry.value);
@@ -755,8 +761,8 @@ function App() {
             {tab === "risorse" && <Risorse resources={resources} onChange={persistResources} tipiRisorsa={tipiRisorsa} onChangeTipi={persistTipiRisorsa} />}
             {tab === "attivazioni" && !wizardOpen && <Attivazioni log={log} missions={missions} resources={resources} onNuova={() => setWizardOpen(true)} onApriScheda={apriSchedaDaLog} onConcludi={concludiAttivazione} onSync={() => syncToSheet(null)} syncStatus={syncStatus} sheetsConfigured={!!sheetsUrl} />}
             {tab === "attivazioni" && wizardOpen && <Wizard resources={resources} onCancel={() => setWizardOpen(false)} onComplete={handleWizardComplete} />}
-            {tab === "brogliaccio" && <Brogliaccio log={log} onChange={persistLog} resources={resources} onApriScheda={apriSchedaDaLog} />}
-            {tab === "missioni" && <Missioni missions={missions} resources={resources} onChange={persistMissions} openId={openMissionId} setOpenId={setOpenMissionId} onAssignResource={assegnaRisorsaAMissione} onSync={syncToSheet} syncStatus={syncStatus} sheetsConfigured={!!sheetsUrl} />}
+            {tab === "brogliaccio" && <Brogliaccio log={log} onChange={persistLog} resources={resources} missions={missions} onApriScheda={apriSchedaDaLog} />}
+            {tab === "missioni" && <Missioni missions={missions} resources={resources} log={log} onChange={persistMissions} openId={openMissionId} setOpenId={setOpenMissionId} onAssignResource={assegnaRisorsaAMissione} onSync={syncToSheet} syncStatus={syncStatus} sheetsConfigured={!!sheetsUrl} />}
             {tab === "impostazioni" && <Impostazioni sheetsUrl={sheetsUrl} onChangeSheetsUrl={persistSheetsUrl} onSyncNow={() => syncToSheet(null)} onLoadNow={loadFromSheet} syncStatus={syncStatus} />}
           </div>
         </div>
@@ -1177,11 +1183,25 @@ function Attivazioni({ log, missions, resources, onNuova, onApriScheda, onConclu
 }
 
 // ================= Brogliaccio =================
-function Brogliaccio({ log, onChange, resources, onApriScheda }) {
+function Brogliaccio({ log, onChange, resources, missions, onApriScheda }) {
   const [form, setForm] = useState({ ora: nowTime(), mezzo: "", tipoEvento: "", luogo: "", note: "" });
   const add = () => { onChange([{ id: uid(), ...form, stato: "in corso", missionId: null, numero: null, codiceInvio: "", creato: Date.now() }, ...log]); setForm({ ora: nowTime(), mezzo: "", tipoEvento: "", luogo: "", note: "" }); };
   const chiudi = (id) => onChange(log.map((l) => (l.id === id ? { ...l, stato: "conclusa" } : l)));
   const remove = (id) => onChange(log.filter((l) => l.id !== id));
+  const setOra = (id, ora) => onChange(log.map((l) => (l.id === id ? { ...l, ora } : l)));
+
+  // Stessa regola di "Attivazioni": la scheda missione (dati paziente) si apre solo quando almeno
+  // un mezzo assegnato è "Sull'intervento". Se la riga non è ancora agganciata a una missione, o non
+  // ha mezzi assegnati, non c'è nulla da verificare e si può aprire/creare liberamente.
+  const prontaPerScheda = (l) => {
+    if (!l.missionId) return true;
+    const m = (missions || []).find((mm) => mm.id === l.missionId);
+    if (!m || !m.risorse || m.risorse.length === 0) return true;
+    return m.risorse.some((rr) => {
+      const res = resources.find((x) => x.id === rr.resourceId);
+      return res && res.stato === "sul_intervento";
+    });
+  };
   return (
     <div>
       <div style={card}>
@@ -1200,10 +1220,21 @@ function Brogliaccio({ log, onChange, resources, onApriScheda }) {
       </div>
       <div style={{ marginTop: 16 }}>
         {log.length === 0 && <div style={{ color: "#64748b", fontSize: 13, padding: 20, textAlign: "center" }}>Nessuna voce registrata.</div>}
-        {log.map((l) => (
+        {log.map((l) => {
+          const pronta = prontaPerScheda(l);
+          return (
           <div key={l.id} style={{ ...card, padding: "12px 14px", marginBottom: 8 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-              <span style={{ fontFamily: "monospace", color: "#38bdf8", fontWeight: 700 }}><Clock size={12} style={{ marginRight: 4, verticalAlign: -1 }} />{l.ora}</span>
+              <span style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                <Clock size={12} color="#38bdf8" />
+                <input
+                  type="time"
+                  value={l.ora}
+                  onChange={(e) => setOra(l.id, e.target.value)}
+                  title="Modifica manualmente l'orario di questa voce"
+                  style={{ ...input, width: 82, padding: "3px 6px", fontSize: 12, fontFamily: "monospace", color: "#38bdf8", fontWeight: 700 }}
+                />
+              </span>
               {l.numero && <span style={{ fontFamily: "monospace", fontSize: 11, color: "#64748b", background: "#0f172a", padding: "2px 6px", borderRadius: 4 }}>N. {l.numero}</span>}
               <span style={{ fontWeight: 600 }}>{l.mezzo || "—"}</span>
               <span style={{ color: "#94a3b8" }}>{l.tipoEvento}</span>
@@ -1213,20 +1244,35 @@ function Brogliaccio({ log, onChange, resources, onApriScheda }) {
             </div>
             {l.note && <div style={{ fontSize: 12, color: "#64748b", marginTop: 4 }}>{l.note}</div>}
             <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-              <button style={btnSecondary} onClick={() => onApriScheda(l)}>{l.missionId ? "Apri scheda missione" : "+ Apri scheda missione"}</button>
+              <button
+                style={{ ...btnSecondary, ...(pronta ? {} : { opacity: 0.4, cursor: "not-allowed", borderColor: "#334155", color: "#64748b" }) }}
+                disabled={!pronta}
+                title={pronta ? "" : "Disponibile quando il mezzo è sull'intervento"}
+                onClick={() => pronta && onApriScheda(l)}
+              >
+                {l.missionId ? "Apri scheda missione" : "+ Apri scheda missione"}
+              </button>
               {l.stato !== "conclusa" && <button style={btnGhost} onClick={() => chiudi(l.id)}>Chiudi</button>}
               <button style={{ ...btnGhost, color: "#f87171" }} onClick={() => remove(l.id)}><Trash2 size={13} /></button>
             </div>
           </div>
-        ))}
+          );
+        })}
       </div>
     </div>
   );
 }
 
 // ================= Missioni =================
-function Missioni({ missions, resources, onChange, openId, setOpenId, onAssignResource, onSync, syncStatus, sheetsConfigured }) {
+function Missioni({ missions, resources, log, onChange, openId, setOpenId, onAssignResource, onSync, syncStatus, sheetsConfigured }) {
   const open = missions.find((m) => m.id === openId);
+
+  // Una missione è "conclusa" quando la relativa richiesta di attivazione è stata chiusa (manualmente
+  // da "Concludi" in Attivazioni, o automaticamente quando il mezzo arriva "In ospedale").
+  const isConclusa = (m) => (log || []).some((l) => l.missionId === m.id && l.stato === "conclusa" && !l.auto);
+  const attive = missions.filter((m) => !isConclusa(m));
+  const concluse = missions.filter((m) => isConclusa(m)).sort((a, b) => String(b.numero || "").localeCompare(String(a.numero || "")));
+  const missioniOrdinate = [...attive, ...concluse];
   const updateMission = (id, patch) => onChange(missions.map((m) => (m.id === id ? { ...m, ...patch } : m)));
   const updatePaziente = (missionId, patientId, patch) => onChange(missions.map((m) => (m.id !== missionId ? m : { ...m, pazienti: m.pazienti.map((p) => (p.id === patientId ? { ...p, ...patch } : p)) })));
   const addPaziente = (missionId) => onChange(missions.map((m) => (m.id !== missionId ? m : { ...m, pazienti: [...m.pazienti, emptyPaziente()] })));
@@ -1259,21 +1305,25 @@ function Missioni({ missions, resources, onChange, openId, setOpenId, onAssignRe
         <button style={btnSecondary} onClick={exportCsv}><Download size={14} /> Esporta CSV (Google Sheets)</button>
       </div>
       {missions.length === 0 && <div style={{ color: "#64748b", fontSize: 13, padding: 20, textAlign: "center" }}>Nessuna scheda missione. Aprine una da Attivazioni o Brogliaccio.</div>}
-      {missions.map((m) => (
-        <div key={m.id} onClick={() => setOpenId(m.id)} style={{ ...card, padding: "12px 14px", marginBottom: 8, cursor: "pointer", display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+      {missioniOrdinate.map((m) => {
+        const conclusa = isConclusa(m);
+        return (
+        <div key={m.id} onClick={() => setOpenId(m.id)} style={{ ...card, padding: "12px 14px", marginBottom: 8, cursor: "pointer", display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap", ...(conclusa ? { background: "#0f172a", opacity: 0.65 } : {}) }}>
           <span style={{ fontFamily: "monospace", fontSize: 11, color: "#64748b", background: "#0f172a", padding: "2px 6px", borderRadius: 4 }}>N. {m.numero}</span>
-          <span style={{ fontFamily: "monospace", color: "#38bdf8", fontWeight: 700 }}>{m.ora}</span>
-          <span style={{ fontWeight: 600 }}>{m.pazienti.length === 1 ? (m.pazienti[0].nome || m.pazienti[0].cognome ? `${m.pazienti[0].nome} ${m.pazienti[0].cognome}`.trim() : "Paziente non identificato") : `${m.pazienti.length} pazienti`}</span>
+          <span style={{ fontFamily: "monospace", color: conclusa ? "#64748b" : "#38bdf8", fontWeight: 700 }}>{m.ora}</span>
+          <span style={{ fontWeight: 600, color: conclusa ? "#94a3b8" : "inherit" }}>{m.pazienti.length === 1 ? (m.pazienti[0].nome || m.pazienti[0].cognome ? `${m.pazienti[0].nome} ${m.pazienti[0].cognome}`.trim() : "Paziente non identificato") : `${m.pazienti.length} pazienti`}</span>
+          {conclusa && <span style={{ fontSize: 10.5, fontWeight: 700, letterSpacing: 0.5, color: "#64748b", background: "#1e293b", padding: "2px 8px", borderRadius: 20 }}>CONCLUSA</span>}
           {m.codiceInvio && <span style={{ fontSize: 11, color: "#64748b" }}>invio: <Badge bg={COLORI[m.codiceInvio].bg} color="#0b1220" text={COLORI[m.codiceInvio].label} /></span>}
           <span style={{ marginLeft: "auto", display: "flex", gap: 6 }}>
             {m.pazienti.map((p, i) => {
               const codice = p.rifiutaTrasporto ? null : (p.codiceTrasporto || suggerisciColoreTrasporto(p));
-              return p.rifiutaTrasporto ? <Badge key={p.id} bg="#334155" color="#cbd5e1" text="RTS" /> : codice ? <Badge key={p.id} bg={COLORI[codice].bg} color="#0b1220" text={m.pazienti.length > 1 ? `P${i + 1} ${COLORI[codice].label}` : COLORI[codice].label} /> : <Badge key={p.id} bg="#1e293b" color="#64748b" text="DA VALUTARE" />;
+              return p.rifiutaTrasporto ? <Badge key={p.id} bg="#334155" color="#cbd5e1" text="RTS" /> : codice ? <Badge key={p.id} bg={conclusa ? "#334155" : COLORI[codice].bg} color={conclusa ? "#94a3b8" : "#0b1220"} text={m.pazienti.length > 1 ? `P${i + 1} ${COLORI[codice].label}` : COLORI[codice].label} /> : <Badge key={p.id} bg="#1e293b" color="#64748b" text="DA VALUTARE" />;
             })}
           </span>
           <ChevronRight size={16} color="#64748b" />
         </div>
-      ))}
+        );
+      })}
     </div>
   );
 }
