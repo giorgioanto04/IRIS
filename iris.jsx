@@ -178,7 +178,7 @@ function exportBrogliaccioCsv(log) {
 // Schede missione: dati dell'attivazione + una riga per ciascun paziente con tutti i campi della scheda.
 function exportMissioniCsv(missions) {
   const headers = [
-    "N. missione", "Ora attivazione", "Luogo", "Codice invio", "Motivo", "Mezzi assegnati",
+    "N. missione", "N. missione AREU", "Ora attivazione", "Luogo", "Codice invio", "Motivo", "Mezzi assegnati",
     "Paziente", "Cognome", "Nome", "Sesso", "Età", "Codice fiscale",
     "Evento", "Luogo evento", "Coscienza", "Respiro", "Circolo", "Cute",
     "FR", "SAT aria", "SAT O2", "FC", "PA", "Temp", "Glicemia",
@@ -198,7 +198,7 @@ function exportMissioniCsv(missions) {
       const acc = accAttivo ? [accEsitoLabel, p.acc.rcpInCorso ? "RCP in corso" : "", p.acc.accDuranteTrasporto ? "ACC in trasporto" : "", p.acc.roscOre ? `ROSC ${p.acc.roscOre}` : ""].filter(Boolean).join(" · ") : "";
       const codTrasp = p.rifiutaTrasporto ? "" : (p.codiceTrasporto || suggerisciColoreTrasporto(p) || "");
       rows.push([
-        m.numero, m.ora, m.luogo, m.codiceInvio ? COLORI[m.codiceInvio].label : "", m.motivo || "", mezzi,
+        m.numero, m.numeroAreu || "", m.ora, m.luogo, m.codiceInvio ? COLORI[m.codiceInvio].label : "", m.motivo || "", mezzi,
         `P${i + 1}`, p.cognome, p.nome, p.sesso, p.eta, p.codiceFiscale,
         [...(p.eventoTipi || []), p.eventoAltro].filter(Boolean).join(", "),
         p.luogoEvento === "Altro" ? p.luogoEventoAltro : p.luogoEvento,
@@ -236,40 +236,49 @@ async function saveKey(key, value) {
   } catch (e) { console.error("storage error", e); }
 }
 
-// ================= Google Sheet (multi-dispositivo) =================
-// IRIS può appoggiarsi a un foglio Google, tramite un piccolo Google Apps Script pubblicato come
-// "app web" (vedi Impostazioni per le istruzioni). Si usa "text/plain" nel Content-Type per evitare
-// che il browser mandi una richiesta preflight CORS che Apps Script non gestisce.
+// ================= Firebase Realtime Database (multi-dispositivo) =================
+// IRIS si appoggia a un Firebase Realtime Database gratuito (piano Spark), usato via semplici
+// chiamate REST (nessun SDK da caricare): niente più Google Apps Script, niente più cold start.
+// Ogni "chiave" (es. resources:<eventId>) diventa un nodo sotto /iris/<chiave>.json.
+function fbBase(url) { return (url || "").replace(/\/+$/, ""); }
+
 async function sheetsPost(url, payload) {
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "text/plain;charset=utf-8" },
-    body: JSON.stringify(payload),
+  const base = fbBase(url);
+  if (payload.action === "saveMission") {
+    // Le schede missione, oltre alla copia grezza per-evento, vengono salvate anche una per una
+    // sotto /iris/missioni/<id>, comode da consultare/filtrare separatamente se serve.
+    const res = await fetch(`${base}/iris/missioni/${encodeURIComponent(payload.mission.id)}.json`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload.mission),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return { ok: true };
+  }
+  const updated = Date.now();
+  const res = await fetch(`${base}/iris/dati/${encodeURIComponent(payload.key)}.json`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ value: payload.value, updated }),
   });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
-  return data;
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return { updated };
 }
 async function sheetsGet(url, key) {
-  const res = await fetch(`${url}?key=${encodeURIComponent(key)}`, { method: "GET" });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
-  return data.value != null ? data.value : null;
+  const base = fbBase(url);
+  const res = await fetch(`${base}/iris/dati/${encodeURIComponent(key)}.json`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const data = await res.json();
+  return data ? data.value : null;
 }
-// Legge più chiavi in una sola richiesta (usato dal polling automatico ogni 1-2s):
-// restituisce { chiave: { value, updated } } per ogni chiave richiesta.
-async function sheetsGetMany(url, keys) {
-  const res = await fetch(`${url}?keys=${encodeURIComponent(keys.join(","))}`, { method: "GET" });
-  const data = await res.json().catch(() => ({}));
-  if (res.ok && !data.error && data.values) return { values: data.values, legacy: false };
-  const entries = [];
-  for (const key of keys) {
-    const legacyRes = await fetch(`${url}?key=${encodeURIComponent(key)}`, { method: "GET" });
-    const legacyData = await legacyRes.json().catch(() => ({}));
-    if (!legacyRes.ok || legacyData.error) throw new Error(legacyData.error || `HTTP ${legacyRes.status}`);
-    entries.push([key, { value: legacyData.value != null ? legacyData.value : null, updated: legacyData.updated || 0 }]);
-  }
-  return { values: Object.fromEntries(entries), legacy: true };
+// Legge TUTTE le chiavi in una sola richiesta (un solo nodo Firebase): molto più leggero e
+// veloce del polling a più richieste usato con Google Sheet.
+async function sheetsGetMany(url) {
+  const base = fbBase(url);
+  const res = await fetch(`${base}/iris/dati.json`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const data = (await res.json()) || {};
+  return { values: data, legacy: false };
 }
 
 // ================= Wizard attivazione =================
@@ -406,26 +415,26 @@ export default function App() {
   const persistTipiRisorsa = useCallback(async (next) => { setTipiRisorsa(next); await saveKey("tipiRisorsa", next); }, []);
   const persistSheetsUrl = useCallback(async (next) => { setSheetsUrl(next); await saveKey("sheetsUrl", next); }, []);
 
-  // Sincronizzazione manuale con Google Sheet: invia lo stato attuale (risorse, log, missioni)
+  // Sincronizzazione manuale con Firebase: invia lo stato attuale (risorse, log, missioni)
   // sia come "riga leggibile" (foglio Missioni) sia come copia grezza per il multi-dispositivo (foglio Storage).
   const syncToSheet = useCallback(async (mission) => {
-    if (!sheetsUrl) { setSyncStatus("Nessun URL Google Sheet configurato (vedi Impostazioni)."); return; }
+    if (!sheetsUrl) { setSyncStatus("Nessun URL Firebase configurato (vedi Impostazioni)."); return; }
     setSyncStatus("Salvataggio in corso…");
     try {
       await sheetsPost(sheetsUrl, { action: "kv", key: `resources:${currentEventId}`, value: resources });
       await sheetsPost(sheetsUrl, { action: "kv", key: `log:${currentEventId}`, value: log });
       await sheetsPost(sheetsUrl, { action: "kv", key: `missions:${currentEventId}`, value: missions });
       if (mission) await sheetsPost(sheetsUrl, { action: "saveMission", mission });
-      setSyncStatus("Salvato su Google Sheet ✓ (" + nowTime() + ")");
+      setSyncStatus("Salvato su Firebase ✓ (" + nowTime() + ")");
     } catch (err) {
-      console.error("Errore sincronizzazione Google Sheet:", err);
+      console.error("Errore sincronizzazione Firebase:", err);
       setSyncStatus("Errore di sincronizzazione: controlla l'URL nelle Impostazioni.");
     }
   }, [sheetsUrl, currentEventId, resources, log, missions]);
 
   const loadFromSheet = useCallback(async () => {
-    if (!sheetsUrl) { setSyncStatus("Nessun URL Google Sheet configurato (vedi Impostazioni)."); return; }
-    setSyncStatus("Caricamento da Google Sheet…");
+    if (!sheetsUrl) { setSyncStatus("Nessun URL Firebase configurato (vedi Impostazioni)."); return; }
+    setSyncStatus("Caricamento da Firebase…");
     try {
       const r = await sheetsGet(sheetsUrl, `resources:${currentEventId}`);
       const l = await sheetsGet(sheetsUrl, `log:${currentEventId}`);
@@ -433,9 +442,9 @@ export default function App() {
       if (r) { setResources(r); await saveKey(`resources:${currentEventId}`, r); }
       if (l) { setLog(l); await saveKey(`log:${currentEventId}`, l); }
       if (m) { setMissions(m); await saveKey(`missions:${currentEventId}`, m); }
-      setSyncStatus("Dati aggiornati da Google Sheet ✓ (" + nowTime() + ")");
+      setSyncStatus("Dati aggiornati da Firebase ✓ (" + nowTime() + ")");
     } catch (err) {
-      console.error("Errore caricamento Google Sheet:", err);
+      console.error("Errore caricamento Firebase:", err);
       setSyncStatus("Errore nel caricamento: controlla l'URL nelle Impostazioni.");
     }
   }, [sheetsUrl, currentEventId]);
@@ -453,7 +462,7 @@ export default function App() {
   }, [currentEventId]);
 
   // Sincronizzazione automatica in background: ogni volta che qualcosa viene salvato localmente,
-  // se è configurato un Google Sheet lo si aggiorna subito anche lì, senza bisogno di premere un tasto.
+  // se è configurato Firebase lo si aggiorna subito anche lì, senza bisogno di premere un tasto.
   // È "fire and forget": non blocca l'interfaccia e non impedisce il salvataggio locale se fallisce.
   // Tiene traccia, per ogni chiave, dell'ultimo timestamp "aggiornato" che questo dispositivo
   // ha già applicato o inviato: serve al polling per capire se sul foglio c'è qualcosa di più
@@ -481,11 +490,11 @@ export default function App() {
           const res = await sheetsPost(sheetsUrl, { action: "kv", key, value: nextValue });
           if (res && res.updated) remoteTs.current[key] = res.updated;
           setConnectionStatus("connected");
-          setSyncStatus("Sincronizzato con Google Sheet ✓ (" + nowTime() + ")");
+          setSyncStatus("Sincronizzato con Firebase ✓ (" + nowTime() + ")");
         } catch (err) {
-          console.error("Auto-sync Google Sheet:", err);
+          console.error("Auto-sync Firebase:", err);
           setConnectionStatus("error");
-          setSyncStatus("Sincronizzazione automatica non riuscita: controlla l'URL in Impostazioni.");
+          setSyncStatus("Sincronizzazione automatica non riuscita: controlla l'URL Firebase in Impostazioni.");
         }
       }
       queue.running = false;
@@ -494,10 +503,10 @@ export default function App() {
     flush();
   }, [sheetsUrl]);
 
-  // Polling automatico multi-dispositivo: ogni 1.5s, se è configurato un Google Sheet, chiede al
-  // foglio lo stato di "eventi" e (se un evento è aperto) di risorse/log/missioni. Se il foglio ha
-  // una versione più recente di quella già vista da questo dispositivo, la applica in locale — così
-  // un'attivazione fatta dal tablet appare da sola sul PC entro 1-2 secondi, senza dover premere nulla.
+  // Aggiornamento multi-dispositivo: con Firebase non serve più interrogare ogni secondo — il
+  // database avvisa subito (via "server-sent events") quando qualcosa cambia, quindi un'attivazione
+  // fatta dal tablet appare sul PC in una frazione di secondo. Il poll ogni 5s resta solo come
+  // rete di sicurezza (es. se la connessione SSE cade per un attimo).
   useEffect(() => {
     if (!sheetsUrl) return;
     let cancelled = false;
@@ -510,18 +519,15 @@ export default function App() {
         if (currentEventId) {
           keys.push(`resources:${currentEventId}`, `log:${currentEventId}`, `missions:${currentEventId}`);
         }
-        const result = await sheetsGetMany(sheetsUrl, keys);
+        const result = await sheetsGetMany(sheetsUrl);
         const values = result.values;
-        const legacy = result.legacy;
         if (cancelled) return;
         setConnectionStatus("connected");
         for (const key of keys) {
           const entry = values[key];
           if (!entry || entry.value == null) continue;
           if (pendingSyncKeys.current.has(key)) continue;
-          const snapshot = JSON.stringify(entry.value);
-          if (legacy ? snapshot !== localSnapshot.current[key] : entry.updated > (remoteTs.current[key] || 0)) {
-            localSnapshot.current[key] = snapshot;
+          if (entry.updated > (remoteTs.current[key] || 0)) {
             remoteTs.current[key] = entry.updated;
             if (key === "events") setEvents(entry.value);
             else if (key === `resources:${currentEventId}`) setResources(entry.value);
@@ -531,15 +537,20 @@ export default function App() {
           }
         }
       } catch (err) {
-        console.error("Polling Google Sheet:", err);
+        console.error("Sincronizzazione Firebase:", err);
         if (!cancelled) setConnectionStatus("error");
       } finally {
         pollInFlight = false;
       }
     };
     poll();
-    const id = setInterval(poll, 1000);
-    return () => { cancelled = true; clearInterval(id); };
+    // Canale "push": qualsiasi scrittura sotto /iris/dati (fatta da QUALSIASI dispositivo) fa
+    // arrivare un evento qui in tempo reale, e a quel punto si rilegge subito tutto.
+    const es = new EventSource(`${fbBase(sheetsUrl)}/iris/dati.json`);
+    es.onmessage = () => poll();
+    es.onerror = () => { if (!cancelled) setConnectionStatus("error"); };
+    const id = setInterval(poll, 5000);
+    return () => { cancelled = true; es.close(); clearInterval(id); };
   }, [sheetsUrl, currentEventId]);
 
   const persistEvents = useCallback(async (next) => { localSnapshot.current.events = JSON.stringify(next); setEvents(next); await saveKey("events", next); autoSyncKv("events", next); }, [autoSyncKv]);
@@ -551,7 +562,7 @@ export default function App() {
     await saveKey(`missions:${currentEventId}`, next);
     autoSyncKv(`missions:${currentEventId}`, next);
     // Ogni missione modificata viene scritta anche nella scheda "Missioni" (riga leggibile per paziente),
-    // così il foglio resta sempre allineato senza dover premere "Salva su Google Sheet" a parte.
+    // così il database resta sempre allineato senza dover premere "Salva su Firebase" a parte.
     if (sheetsUrl) {
       next.forEach((m) => {
         sheetsPost(sheetsUrl, { action: "saveMission", mission: m }).catch((err) => console.error("Auto-sync missione:", err));
@@ -561,12 +572,16 @@ export default function App() {
 
   const currentEvent = events.find((e) => e.id === currentEventId);
 
+  // Legge il contatore direttamente dallo storage (non dallo stato React, che può essere
+  // "vecchio" se due attivazioni partono a pochi istanti di distanza) prima di incrementarlo:
+  // evita che due schede ricevano lo stesso numero (es. due "001").
   const nextMissionNumber = useCallback(async () => {
-    const seq = missionSeq + 1;
-    setMissionSeq(seq);
+    const current = await loadKey(`missionSeq:${currentEventId}`, 0);
+    const seq = current + 1;
     await saveKey(`missionSeq:${currentEventId}`, seq);
+    setMissionSeq(seq);
     return formatMissionNumber(currentEvent?.date, seq);
-  }, [missionSeq, currentEventId, currentEvent]);
+  }, [currentEventId, currentEvent]);
 
   // Cambia rapidamente lo stato di una risorsa (dalla barra laterale): registra l'orario,
   // crea una riga nel brogliaccio e, se la risorsa è assegnata a una missione ancora aperta,
@@ -631,7 +646,7 @@ export default function App() {
       const numero = await nextMissionNumber();
       const ora = nowTime();
       const risorse = risorseIds.map((id) => resources.find((r) => r.id === id)).filter(Boolean).map(emptyRisorsaMissione);
-      const mission = { id: uid(), numero, ora, luogo, motivo, codiceInvio, risorse, pazienti: [emptyPaziente()] };
+      const mission = { id: uid(), numero, numeroAreu: "", ora, luogo, motivo, codiceInvio, risorse, pazienti: [emptyPaziente()] };
       const logEntry = { id: uid(), ora, mezzo: risorse.map((r) => r.nome).join(", "), luogo, tipoEvento: motivo || "Attivazione", note: "", stato: "in corso", missionId: mission.id, numero, codiceInvio, wizardAnswers: answers, creato: Date.now() };
       // Le risorse inviate su un'attivazione passano automaticamente allo stato "Diretto intervento",
       // così la barra laterale resta allineata con la scheda missione appena creata.
@@ -649,7 +664,7 @@ export default function App() {
   const apriSchedaDaLog = async (logEntry) => {
     if (logEntry.missionId) { setTab("missioni"); setOpenMissionId(logEntry.missionId); return; }
     const numero = await nextMissionNumber();
-    const mission = { id: uid(), numero, ora: logEntry.ora, luogo: logEntry.luogo, motivo: logEntry.tipoEvento, codiceInvio: logEntry.codiceInvio || "", risorse: [], pazienti: [emptyPaziente()] };
+    const mission = { id: uid(), numero, numeroAreu: "", ora: logEntry.ora, luogo: logEntry.luogo, motivo: logEntry.tipoEvento, codiceInvio: logEntry.codiceInvio || "", risorse: [], pazienti: [emptyPaziente()] };
     await persistMissions([mission, ...missions]);
     await persistLog(log.map((l) => (l.id === logEntry.id ? { ...l, missionId: mission.id, numero } : l)));
     setTab("missioni"); setOpenMissionId(mission.id);
@@ -680,7 +695,7 @@ export default function App() {
             {tab === "risorse" && <Risorse resources={resources} onChange={persistResources} tipiRisorsa={tipiRisorsa} onChangeTipi={persistTipiRisorsa} />}
             {tab === "attivazioni" && !wizardOpen && <Attivazioni log={log} missions={missions} resources={resources} onNuova={() => setWizardOpen(true)} onApriScheda={apriSchedaDaLog} onConcludi={concludiAttivazione} onSync={() => syncToSheet(null)} syncStatus={syncStatus} sheetsConfigured={!!sheetsUrl} />}
             {tab === "attivazioni" && wizardOpen && <Wizard resources={resources} onCancel={() => setWizardOpen(false)} onComplete={handleWizardComplete} />}
-            {tab === "brogliaccio" && <Brogliaccio log={log} onChange={persistLog} resources={resources} onApriScheda={apriSchedaDaLog} />}
+            {tab === "brogliaccio" && <Brogliaccio log={log} onChange={persistLog} resources={resources} missions={missions} onApriScheda={apriSchedaDaLog} />}
             {tab === "missioni" && <Missioni missions={missions} resources={resources} onChange={persistMissions} openId={openMissionId} setOpenId={setOpenMissionId} onAssignResource={assegnaRisorsaAMissione} onSync={syncToSheet} syncStatus={syncStatus} sheetsConfigured={!!sheetsUrl} />}
             {tab === "impostazioni" && <Impostazioni sheetsUrl={sheetsUrl} onChangeSheetsUrl={persistSheetsUrl} onSyncNow={() => syncToSheet(null)} onLoadNow={loadFromSheet} syncStatus={syncStatus} />}
           </div>
@@ -709,7 +724,7 @@ function TopBar({ currentEvent, tab, setTab, onNuovaSerata, inEvent, connectionS
         </div>
         {currentEvent && <div style={{ marginLeft: 14, paddingLeft: 14, borderLeft: "1px solid #1e293b", fontSize: 13, color: "#94a3b8" }}>{currentEvent.name} · {currentEvent.date}</div>}
       </div>
-      <div title={{ connected: "Google Sheet connesso", syncing: "Sincronizzazione in corso", error: "Google Sheet non raggiungibile", offline: "Google Sheet non configurato" }[connectionStatus]} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: "#94a3b8" }}>
+      <div title={{ connected: "Firebase connesso", syncing: "Sincronizzazione in corso", error: "Firebase non raggiungibile", offline: "Firebase non configurato" }[connectionStatus]} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: "#94a3b8" }}>
         <span style={{ width: 9, height: 9, borderRadius: "50%", background: { connected: "#22c55e", syncing: "#eab308", error: "#ef4444", offline: "#64748b" }[connectionStatus], boxShadow: connectionStatus === "connected" ? "0 0 8px #22c55e" : "none" }} />
         {connectionStatus === "connected" ? "Connesso" : connectionStatus === "syncing" ? "Sincronizzazione…" : connectionStatus === "error" ? "Offline" : "Non configurato"}
       </div>
@@ -987,21 +1002,21 @@ function Impostazioni({ sheetsUrl, onChangeSheetsUrl, onSyncNow, onLoadNow, sync
   return (
     <div>
       <div style={card}>
-        <div style={{ fontWeight: 700, marginBottom: 8 }}>Google Sheet condiviso (multi-dispositivo)</div>
+        <div style={{ fontWeight: 700, marginBottom: 8 }}>Firebase condiviso (multi-dispositivo, in tempo reale)</div>
         <div style={{ fontSize: 13, color: "#94a3b8", marginBottom: 12, lineHeight: 1.5 }}>
-          Incolla qui l'URL dell'"app web" di Google Apps Script collegata al tuo Google Sheet.
-          Una volta incollato e salvato <b>su questo dispositivo</b>, non serve più fare nulla: ogni
-          modifica (attivazione, cambio stato mezzo, scheda paziente…) viene scritta subito sul foglio,
-          e ogni dispositivo collegato allo stesso URL controlla automaticamente ogni 1-2 secondi se
-          c'è qualcosa di nuovo dagli altri dispositivi, aggiornandosi da solo — niente più tasti
-          "Carica dati" da premere. L'unico passaggio manuale è incollare questo stesso URL su ciascun
-          dispositivo (tablet, PC, cellulare) la prima volta: da lì in poi restano sincronizzati da soli.
-          Vedi in fondo a questa pagina le istruzioni passo passo per crearlo.
+          Incolla qui l'URL del tuo Firebase Realtime Database (finisce in <code>.firebasedatabase.app</code> o
+          <code> .firebaseio.com</code>). Una volta incollato e salvato <b>su questo dispositivo</b>, non serve
+          più fare nulla: ogni modifica (attivazione, cambio stato mezzo, scheda paziente…) viene scritta
+          subito sul database, e ogni dispositivo collegato allo stesso URL riceve l'aggiornamento in tempo
+          reale — niente più attese, niente più tasti "Carica dati" da premere. L'unico passaggio manuale è
+          incollare questo stesso URL su ciascun dispositivo (tablet, PC, cellulare) la prima volta: da lì in
+          poi restano sincronizzati da soli. Vedi in fondo a questa pagina le istruzioni passo passo per crearlo
+          (5 minuti, gratuito).
         </div>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
           <input
             style={{ ...input, flex: 1, minWidth: 260, boxSizing: "border-box" }}
-            placeholder="https://script.google.com/macros/s/AKfycb.../exec"
+            placeholder="https://iris-xxxx-default-rtdb.europe-west1.firebasedatabase.app"
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
           />
@@ -1009,26 +1024,34 @@ function Impostazioni({ sheetsUrl, onChangeSheetsUrl, onSyncNow, onLoadNow, sync
         </div>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
           <button style={btnSecondary} onClick={onSyncNow}><Download size={14} style={{ transform: "rotate(180deg)" }} /> Sincronizza ora (invia)</button>
-          <button style={btnSecondary} onClick={onLoadNow}><Download size={14} /> Carica dati dal foglio</button>
+          <button style={btnSecondary} onClick={onLoadNow}><Download size={14} /> Carica dati dal database</button>
         </div>
         {syncStatus && <div style={{ fontSize: 12, color: "#64748b", marginTop: 10 }}>{syncStatus}</div>}
       </div>
 
       <div style={{ ...card, marginTop: 16 }}>
-        <div style={{ fontWeight: 700, marginBottom: 8 }}>Come creare il foglio Google e collegarlo (una volta sola)</div>
+        <div style={{ fontWeight: 700, marginBottom: 8 }}>Come creare il database Firebase e collegarlo (una volta sola)</div>
         <ol style={{ fontSize: 13, color: "#cbd5e1", lineHeight: 1.8, paddingLeft: 20, margin: 0 }}>
-          <li>Vai su <b>sheets.google.com</b> e crea un nuovo foglio vuoto. Chiamalo ad es. "IRIS dati".</li>
-          <li>Nel foglio, in alto, apri <b>Estensioni → Apps Script</b>.</li>
-          <li>Cancella il contenuto di esempio e incolla il codice che trovi nel file <code>google-apps-script.gs</code>
-            (te lo fornisco insieme a questi file: apri IRIS con GitHub Pages/Claude, poi copia tutto il contenuto).</li>
-          <li>Clicca il dischetto per salvare, poi <b>Esegui</b> una volta (Apps Script ti chiederà l'autorizzazione:
-            accetta, è il tuo stesso foglio).</li>
-          <li>Clicca <b>Deploy → Nuova implementazione</b>, tipo "App web". Come "Chi ha accesso" scegli
-            <b> Chiunque</b> (serve per farla funzionare da qualunque computer/telefono senza login Google ripetuto).</li>
-          <li>Copia l'URL che termina con <code>/exec</code> e incollalo qui sopra, poi premi "Salva URL".</li>
-          <li>Da questo momento i tasti "Salva su Google Sheet" scrivono nel foglio due schede (tab) create
-            automaticamente: <b>Storage</b> (dati grezzi dell'app, per il multi-dispositivo) e <b>Missioni</b>
-            (una riga leggibile per paziente, comoda da stampare/filtrare/esportare).</li>
+          <li>Vai su <b>console.firebase.google.com</b> e accedi con un account Google. Clicca <b>Crea un progetto</b>,
+            dagli un nome (es. "iris-118"), e nella schermata successiva puoi disattivare Google Analytics (non serve).</li>
+          <li>Nel menu a sinistra apri <b>Build → Realtime Database</b>, poi <b>Crea database</b>. Scegli la
+            località più vicina (es. Europe-west1) e come modalità iniziale <b>"Avvia in modalità test"</b>.</li>
+          <li>Aperto il database, clicca sulla scheda <b>Regole</b> in alto e incolla queste regole (permettono
+            all'app di leggere e scrivere solo sotto il nodo "iris", senza login):
+            <pre style={{ background: "#0f172a", padding: 10, borderRadius: 6, fontSize: 11.5, overflowX: "auto", marginTop: 6 }}>{`{
+  "rules": {
+    "iris": { ".read": true, ".write": true },
+    ".read": false,
+    ".write": false
+  }
+}`}</pre>
+            poi clicca <b>Pubblica</b>. Nota: chiunque conosca l'URL può leggere/scrivere i dati (come già
+            avveniva con "Chiunque" su Google Apps Script) — non condividere l'URL fuori dalla tua squadra.</li>
+          <li>Torna nella scheda <b>Dati</b>: in alto trovi l'URL del database, tipo
+            <code> https://iris-118-default-rtdb.europe-west1.firebasedatabase.app</code>. Copialo (senza
+            barra finale) e incollalo qui sopra, poi premi "Salva URL".</li>
+          <li>Da questo momento tutto si sincronizza da solo e in tempo reale tra tutti i dispositivi che hanno
+            lo stesso URL salvato in Impostazioni. Non serve nessun Google Apps Script, nessun foglio Google.</li>
         </ol>
       </div>
     </div>
@@ -1059,7 +1082,7 @@ function Attivazioni({ log, missions, resources, onNuova, onApriScheda, onConclu
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14, flexWrap: "wrap", gap: 10 }}>
         <div style={{ fontSize: 13, color: "#94a3b8" }}>Avvia una nuova richiesta e assegna il codice colore d'invio.</div>
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <button style={btnSecondary} onClick={onSync} title={sheetsConfigured ? "" : "Configura l'URL in Impostazioni"}><Download size={14} style={{ transform: "rotate(180deg)" }} /> Salva su Google Sheet</button>
+          <button style={btnSecondary} onClick={onSync} title={sheetsConfigured ? "" : "Configura l'URL in Impostazioni"}><Download size={14} style={{ transform: "rotate(180deg)" }} /> Salva su Firebase</button>
           <button style={btnPrimary} onClick={onNuova}><Siren size={16} /> Nuova attivazione</button>
         </div>
       </div>
@@ -1094,11 +1117,26 @@ function Attivazioni({ log, missions, resources, onNuova, onApriScheda, onConclu
 }
 
 // ================= Brogliaccio =================
-function Brogliaccio({ log, onChange, resources, onApriScheda }) {
+function Brogliaccio({ log, onChange, resources, missions, onApriScheda }) {
   const [form, setForm] = useState({ ora: nowTime(), mezzo: "", tipoEvento: "", luogo: "", note: "" });
-  const add = () => { onChange([{ id: uid(), ...form, stato: "in corso", missionId: null, numero: null, codiceInvio: "", creato: Date.now() }, ...log]); setForm({ ora: nowTime(), mezzo: "", tipoEvento: "", luogo: "", note: "" }); };
+  // Ordina sempre per orario (dal più recente) e ripubblica: usata dopo ogni modifica dell'ora
+  // di una riga, così la voce si sposta subito al posto giusto senza bisogno di altre azioni.
+  const sortByOra = (rows) => [...rows].sort((a, b) => (b.ora || "").localeCompare(a.ora || "") || (b.creato || 0) - (a.creato || 0));
+  const add = () => { onChange(sortByOra([{ id: uid(), ...form, stato: "in corso", missionId: null, numero: null, codiceInvio: "", creato: Date.now() }, ...log])); setForm({ ora: nowTime(), mezzo: "", tipoEvento: "", luogo: "", note: "" }); };
   const chiudi = (id) => onChange(log.map((l) => (l.id === id ? { ...l, stato: "conclusa" } : l)));
   const remove = (id) => onChange(log.filter((l) => l.id !== id));
+  const setOra = (id, ora) => onChange(sortByOra(log.map((l) => (l.id === id ? { ...l, ora } : l))));
+  // Come in Attivazioni: la scheda missione si apre solo quando almeno un mezzo assegnato
+  // alla missione collegata è "Sull'intervento" (il paziente è davanti all'equipaggio).
+  const prontaPerScheda = (l) => {
+    if (!l.missionId) return true; // nessuna missione collegata: creane una nuova, nessun vincolo
+    const m = (missions || []).find((mm) => mm.id === l.missionId);
+    if (!m || !m.risorse || m.risorse.length === 0) return true;
+    return m.risorse.some((rr) => {
+      const res = resources.find((x) => x.id === rr.resourceId);
+      return res && res.stato === "sul_intervento";
+    });
+  };
   return (
     <div>
       <div style={card}>
@@ -1117,10 +1155,12 @@ function Brogliaccio({ log, onChange, resources, onApriScheda }) {
       </div>
       <div style={{ marginTop: 16 }}>
         {log.length === 0 && <div style={{ color: "#64748b", fontSize: 13, padding: 20, textAlign: "center" }}>Nessuna voce registrata.</div>}
-        {log.map((l) => (
+        {log.map((l) => {
+          const pronta = prontaPerScheda(l);
+          return (
           <div key={l.id} style={{ ...card, padding: "12px 14px", marginBottom: 8 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-              <span style={{ fontFamily: "monospace", color: "#38bdf8", fontWeight: 700 }}><Clock size={12} style={{ marginRight: 4, verticalAlign: -1 }} />{l.ora}</span>
+              <input type="time" value={l.ora} onChange={(e) => setOra(l.id, e.target.value)} style={{ ...input, width: 90, fontFamily: "monospace", color: "#38bdf8", fontWeight: 700 }} />
               {l.numero && <span style={{ fontFamily: "monospace", fontSize: 11, color: "#64748b", background: "#0f172a", padding: "2px 6px", borderRadius: 4 }}>N. {l.numero}</span>}
               <span style={{ fontWeight: 600 }}>{l.mezzo || "—"}</span>
               <span style={{ color: "#94a3b8" }}>{l.tipoEvento}</span>
@@ -1130,12 +1170,20 @@ function Brogliaccio({ log, onChange, resources, onApriScheda }) {
             </div>
             {l.note && <div style={{ fontSize: 12, color: "#64748b", marginTop: 4 }}>{l.note}</div>}
             <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-              <button style={btnSecondary} onClick={() => onApriScheda(l)}>{l.missionId ? "Apri scheda missione" : "+ Apri scheda missione"}</button>
+              <button
+                style={{ ...btnSecondary, ...(pronta ? {} : { opacity: 0.4, cursor: "not-allowed", borderColor: "#334155", color: "#64748b" }) }}
+                disabled={!pronta}
+                title={pronta ? "" : "Disponibile quando il mezzo è sull'intervento"}
+                onClick={() => pronta && onApriScheda(l)}
+              >
+                {l.missionId ? "Apri scheda missione" : "+ Apri scheda missione"}
+              </button>
               {l.stato !== "conclusa" && <button style={btnGhost} onClick={() => chiudi(l.id)}>Chiudi</button>}
               <button style={{ ...btnGhost, color: "#f87171" }} onClick={() => remove(l.id)}><Trash2 size={13} /></button>
             </div>
           </div>
-        ))}
+          );
+        })}
       </div>
     </div>
   );
@@ -1173,7 +1221,7 @@ function Missioni({ missions, resources, onChange, openId, setOpenId, onAssignRe
   return (
     <div>
       <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 10 }}>
-        <button style={btnSecondary} onClick={exportCsv}><Download size={14} /> Esporta CSV (Google Sheets)</button>
+        <button style={btnSecondary} onClick={exportCsv}><Download size={14} /> Esporta CSV</button>
       </div>
       {missions.length === 0 && <div style={{ color: "#64748b", fontSize: 13, padding: 20, textAlign: "center" }}>Nessuna scheda missione. Aprine una da Attivazioni o Brogliaccio.</div>}
       {missions.map((m) => (
@@ -1279,7 +1327,7 @@ function CircoloPicker({ value, onChange }) {
       <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
         {["Periferico", "Centrale"].map((o) => <button key={o} disabled={v.assente} onClick={() => setTipo(o)} style={{ ...toggleBtn, opacity: v.assente ? 0.4 : 1, ...(v.tipo === o ? activeToggle : {}) }}>{o}</button>)}
         {["Ritmico", "Aritmico"].map((o) => <button key={o} disabled={v.assente} onClick={() => setRitmo(o)} style={{ ...toggleBtn, opacity: v.assente ? 0.4 : 1, ...(v.ritmo === o ? activeToggle : {}) }}>{o}</button>)}
-        <button onClick={setAssente} style={{ ...toggleBtn, borderColor: "#dc2626", color: v.assente ? "#0b1220" : "#f87171", background: v.assente ? "#dc2626" : "transparent" }}>Assente</button>
+        <button onClick={setAssente} style={{ ...toggleBtn, ...(v.assente ? activeToggle : {}) }}>Assente</button>
       </div>
     </div>
   );
@@ -1390,47 +1438,68 @@ function RisorseMissione({ missionRisorse, allResources, onChange, onAssignResou
 
 // ================= Scheda missione (multi-paziente) =================
 function SchedaMissione({ mission: m, resources, onUpdateMission, onUpdatePaziente, onAddPaziente, onRemovePaziente, onClose, onDelete, onAssignResource, onSync, syncStatus, sheetsConfigured }) {
+  // Bozza locale: tutto quello che si scrive a mano resta solo qui finché non si preme "Salva".
+  // Così la scheda non manda una richiesta di rete ad ogni carattere digitato.
+  const [draft, setDraft] = useState(m);
+  const [dirty, setDirty] = useState(false);
   const [activeId, setActiveId] = useState(m.pazienti[0]?.id);
   const [confirmDelete, setConfirmDelete] = useState(false);
-  useEffect(() => { if (!m.pazienti.find((p) => p.id === activeId)) setActiveId(m.pazienti[0]?.id); }, [m.pazienti]); // eslint-disable-line
-  const p = m.pazienti.find((x) => x.id === activeId) || m.pazienti[0];
+  // Se cambia la missione aperta (es. si torna alla lista e se ne apre un'altra), riparte da zero.
+  useEffect(() => { setDraft(m); setDirty(false); }, [m.id]); // eslint-disable-line
+  useEffect(() => { if (!draft.pazienti.find((p) => p.id === activeId)) setActiveId(draft.pazienti[0]?.id); }, [draft.pazienti]); // eslint-disable-line
+  const p = draft.pazienti.find((x) => x.id === activeId) || draft.pazienti[0];
   const suggerito = suggerisciColoreTrasporto(p);
-  const setP = (patch) => onUpdatePaziente(p.id, patch);
-  const setAcc = (patch) => onUpdatePaziente(p.id, { acc: { ...p.acc, ...patch } });
+  const setDraftPatch = (patch) => { setDraft((d) => ({ ...d, ...patch })); setDirty(true); };
+  const setP = (patch) => { setDraft((d) => ({ ...d, pazienti: d.pazienti.map((x) => (x.id === p.id ? { ...x, ...patch } : x)) })); setDirty(true); };
+  const setAcc = (patch) => setP({ acc: { ...p.acc, ...patch } });
+  const addPaziente = () => { setDraft((d) => ({ ...d, pazienti: [...d.pazienti, emptyPaziente()] })); setDirty(true); };
+  const removePaziente = (pid) => { setDraft((d) => ({ ...d, pazienti: d.pazienti.filter((x) => x.id !== pid) })); setDirty(true); };
+  // Manda tutta la bozza al genitore in un colpo solo: da qui parte il salvataggio locale
+  // e la sincronizzazione su Firebase, non più ad ogni singolo campo modificato.
+  const salva = () => { onUpdateMission(draft); setDirty(false); };
+  const chiudi = () => { if (dirty) salva(); onClose(); };
 
   return (
     <div>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
-        <button style={btnGhost} onClick={onClose}><X size={14} /> Torna alle schede</button>
-        <div style={{ fontFamily: "monospace", fontSize: 13, color: "#38bdf8", fontWeight: 700 }}>Scheda missione N. {m.numero}</div>
+        <button style={btnGhost} onClick={chiudi}><X size={14} /> Torna alle schede</button>
+        <div style={{ fontFamily: "monospace", fontSize: 13, color: "#38bdf8", fontWeight: 700 }}>Scheda missione N. {draft.numero}</div>
         <button style={{ ...btnGhost, color: "#f87171" }} onClick={() => setConfirmDelete(true)}><Trash2 size={14} /> Elimina</button>
       </div>
 
-      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14, flexWrap: "wrap" }}>
-        <button style={btnSecondary} onClick={onSync} title={sheetsConfigured ? "" : "Configura l'URL in Impostazioni"}><Download size={14} style={{ transform: "rotate(180deg)" }} /> Salva su Google Sheet</button>
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14, flexWrap: "wrap", position: "sticky", top: 62, background: "#0b1220", zIndex: 5, padding: "8px 0" }}>
+        <button
+          style={{ ...btnPrimary, background: dirty ? "#16a34a" : "#166534", opacity: dirty ? 1 : 0.6, cursor: dirty ? "pointer" : "default" }}
+          onClick={salva}
+        >
+          <ClipboardList size={14} /> {dirty ? "Salva" : "Salvato"}
+        </button>
+        {dirty && <span style={{ fontSize: 12, color: "#fcd34d" }}>Modifiche non salvate</span>}
+        <button style={btnSecondary} onClick={onSync} title={sheetsConfigured ? "" : "Configura l'URL in Impostazioni"}><Download size={14} style={{ transform: "rotate(180deg)" }} /> Salva su Firebase</button>
         {syncStatus && <span style={{ fontSize: 12, color: "#64748b" }}>{syncStatus}</span>}
       </div>
 
       <Section title="Dati missione">
         <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-          <input style={{ ...input, width: 90 }} type="time" value={m.ora} onChange={(e) => onUpdateMission({ ora: e.target.value })} />
-          <input style={{ ...input, flex: 1, minWidth: 160 }} placeholder="Luogo (via/piazza, comune)" value={m.luogo} onChange={(e) => onUpdateMission({ luogo: e.target.value })} />
-          {m.codiceInvio && <span style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ fontSize: 12, color: "#64748b" }}>invio:</span><Badge bg={COLORI[m.codiceInvio].bg} color="#0b1220" text={COLORI[m.codiceInvio].label} /></span>}
+          <input style={{ ...input, width: 90 }} type="time" value={draft.ora} onChange={(e) => setDraftPatch({ ora: e.target.value })} />
+          <input style={{ ...input, flex: 1, minWidth: 160 }} placeholder="Luogo (via/piazza, comune)" value={draft.luogo} onChange={(e) => setDraftPatch({ luogo: e.target.value })} />
+          <input style={{ ...input, width: 160 }} placeholder="N. missione AREU" value={draft.numeroAreu || ""} onChange={(e) => setDraftPatch({ numeroAreu: e.target.value })} />
+          {draft.codiceInvio && <span style={{ display: "flex", alignItems: "center", gap: 6 }}><span style={{ fontSize: 12, color: "#64748b" }}>invio:</span><Badge bg={COLORI[draft.codiceInvio].bg} color="#0b1220" text={COLORI[draft.codiceInvio].label} /></span>}
         </div>
       </Section>
 
       <Section title="Risorse assegnate alla missione">
-        <RisorseMissione missionRisorse={m.risorse} allResources={resources} onChange={(next) => onUpdateMission({ risorse: next })} onAssignResource={onAssignResource} />
+        <RisorseMissione missionRisorse={draft.risorse} allResources={resources} onChange={(next) => setDraftPatch({ risorse: next })} onAssignResource={onAssignResource} />
       </Section>
 
       <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 16, marginBottom: -4, flexWrap: "wrap" }}>
-        {m.pazienti.map((pz, i) => (
+        {draft.pazienti.map((pz, i) => (
           <button key={pz.id} onClick={() => setActiveId(pz.id)} style={{ ...toggleBtn, ...(pz.id === p.id ? activeToggle : {}) }}>
             Paziente {i + 1}{pz.cognome ? ` · ${pz.cognome}` : ""}
           </button>
         ))}
-        <button style={btnSecondary} onClick={onAddPaziente}><Plus size={14} /> Aggiungi paziente</button>
-        {m.pazienti.length > 1 && <button style={{ ...btnGhost, color: "#f87171" }} onClick={() => onRemovePaziente(p.id)}><Trash2 size={13} /> Rimuovi questo paziente</button>}
+        <button style={btnSecondary} onClick={addPaziente}><Plus size={14} /> Aggiungi paziente</button>
+        {draft.pazienti.length > 1 && <button style={{ ...btnGhost, color: "#f87171" }} onClick={() => removePaziente(p.id)}><Trash2 size={13} /> Rimuovi questo paziente</button>}
       </div>
 
       <Section title="Dati paziente">
