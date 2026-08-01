@@ -18,15 +18,32 @@ const TIPI_POSTAZIONE = ["PMA", "Ospedale"]; // tipi che gestiscono un elenco di
 
 // Stati rapidi del mezzo/risorsa, mostrati nella barra laterale.
 // "campo" indica quale orario della scheda missione viene aggiornato quando si seleziona lo stato.
+// Palette deliberatamente diversa da COLORI (verde/giallo/rosso = codici missione): qui si usa una
+// progressione coerente blu → viola che segue il "viaggio" del mezzo, senza mai coincidere con i
+// colori di triage/invio, per evitare ambiguità visiva tra i due sistemi.
 const STATI_MEZZO = [
-  { id: "operativo", label: "Operativo", short: "OPER.", color: "#16a34a", campo: null },
-  { id: "diretto_intervento", label: "Diretto intervento", short: "DIR. INT.", color: "#eab308", campo: "oraPartenza" },
-  { id: "sul_intervento", label: "Sull'intervento", short: "S. INT.", color: "#f97316", campo: "oraSulPosto" },
-  { id: "diretto_ospedale", label: "Diretto ospedale", short: "DIR. OSP.", color: "#dc2626", campo: "oraTrasporto" },
+  { id: "operativo", label: "Operativo", short: "OPER.", color: "#10b981", campo: null },
+  { id: "diretto_intervento", label: "Diretto intervento", short: "DIR. INT.", color: "#0ea5e9", campo: "oraPartenza" },
+  { id: "sul_intervento", label: "Sull'intervento", short: "S. INT.", color: "#6366f1", campo: "oraSulPosto" },
+  { id: "diretto_ospedale", label: "Diretto ospedale", short: "DIR. OSP.", color: "#8b5cf6", campo: "oraTrasporto" },
   { id: "in_ospedale", label: "In ospedale", short: "OSPEDALE", color: "#a855f7", campo: "oraOspedale" },
-  { id: "libero_rientro", label: "Libero in rientro", short: "RIENTRO", color: "#38bdf8", campo: "oraRitorno" },
+  { id: "libero_rientro", label: "Libero in rientro", short: "RIENTRO", color: "#14b8a6", campo: "oraRitorno" },
 ];
 const STATO_ALTRO = { id: "altro", label: "Altro", short: "ALTRO", color: "#64748b", campo: null };
+
+// ================= Design tokens =================
+// Font monospazio "neutro" riservato SOLO ai numeri missione e agli orari: dà uniformità e li rende
+// riconoscibili a colpo d'occhio rispetto al resto del testo (che resta in Inter/sans-serif).
+const FONT_MONO = "'JetBrains Mono', ui-monospace, 'SF Mono', Consolas, monospace";
+const ACCENT = "#38bdf8"; // unico colore "operativo neutro" per elementi interattivi non semantici (bottoni, focus, link)
+// Chip del numero missione: grande, in grassetto, sempre riconoscibile allo stesso modo ovunque appaia.
+const missionChip = {
+  fontFamily: FONT_MONO, fontWeight: 800, fontSize: 15, letterSpacing: 0.5,
+  color: "#e2e8f0", background: "#0f172a", border: "1px solid #1e293b",
+  borderRadius: 6, padding: "3px 10px", whiteSpace: "nowrap",
+};
+const missionChipSmall = { ...missionChip, fontSize: 12.5, padding: "2px 8px", fontWeight: 700 };
+const timeChip = { fontFamily: FONT_MONO, fontWeight: 700, fontSize: 13, color: ACCENT, whiteSpace: "nowrap" };
 
 // Trova, tra le missioni dell'evento, la più recente a cui la risorsa risulta assegnata (le missioni
 // sono ordinate dalla più recente): è quella su cui riportare gli orari quando cambia lo stato del mezzo.
@@ -801,7 +818,10 @@ function ResourceStatusCard({ resource, missions, onSetStato }) {
         <span className={current === "operativo" ? "" : "iris-dot-blink"} style={{ width: 8, height: 8, borderRadius: "50%", background: def.color, flexShrink: 0, boxShadow: `0 0 6px ${def.color}` }} />
       </div>
       {missioneAttiva && (
-        <div style={{ fontSize: 10.5, color: "#38bdf8", marginBottom: 6, fontFamily: "monospace" }}>Missione N. {missioneAttiva.numero}</div>
+        <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 8 }}>
+          <span style={{ fontSize: 9.5, color: "#64748b", textTransform: "uppercase", letterSpacing: 0.5 }}>Missione</span>
+          <span style={missionChipSmall}>{missioneAttiva.numero}</span>
+        </div>
       )}
 
       <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
@@ -1092,12 +1112,12 @@ function Attivazioni({ log, missions, resources, onNuova, onApriScheda, onConclu
         const pronta = prontaPerScheda(l);
         return (
           <div key={l.id} style={{ ...card, padding: "12px 14px", marginBottom: 8, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-            <span style={{ fontFamily: "monospace", color: "#38bdf8", fontWeight: 700 }}><Clock size={12} style={{ marginRight: 4, verticalAlign: -1 }} />{l.ora}</span>
-            {l.numero && <span style={{ fontFamily: "monospace", fontSize: 11, color: "#64748b", background: "#0f172a", padding: "2px 6px", borderRadius: 4 }}>N. {l.numero}</span>}
+            {l.numero && <span style={missionChip}>{l.numero}</span>}
+            <span style={timeChip}><Clock size={12} style={{ marginRight: 4, verticalAlign: -1 }} />{l.ora}</span>
+            {l.codiceInvio && <Badge bg={COLORI[l.codiceInvio].bg} color="#0b1220" text={COLORI[l.codiceInvio].label} />}
             <span style={{ fontWeight: 600 }}>{l.tipoEvento}</span>
             {l.luogo && <span style={{ color: "#64748b", fontSize: 13 }}>@ {l.luogo}</span>}
             <span style={{ color: "#94a3b8", fontSize: 13 }}>{l.mezzo}</span>
-            {l.codiceInvio && <Badge bg={COLORI[l.codiceInvio].bg} color="#0b1220" text={COLORI[l.codiceInvio].label} />}
             <span style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
               <button
                 style={{ ...btnSecondary, ...(pronta ? {} : { opacity: 0.4, cursor: "not-allowed", borderColor: "#334155", color: "#64748b" }) }}
@@ -1160,8 +1180,8 @@ function Brogliaccio({ log, onChange, resources, missions, onApriScheda }) {
           return (
           <div key={l.id} style={{ ...card, padding: "12px 14px", marginBottom: 8 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-              <input type="time" value={l.ora} onChange={(e) => setOra(l.id, e.target.value)} style={{ ...input, width: 90, fontFamily: "monospace", color: "#38bdf8", fontWeight: 700 }} />
-              {l.numero && <span style={{ fontFamily: "monospace", fontSize: 11, color: "#64748b", background: "#0f172a", padding: "2px 6px", borderRadius: 4 }}>N. {l.numero}</span>}
+              {l.numero && <span style={missionChip}>{l.numero}</span>}
+              <input type="time" value={l.ora} onChange={(e) => setOra(l.id, e.target.value)} style={{ ...input, width: 90, fontFamily: FONT_MONO, color: ACCENT, fontWeight: 700 }} />
               <span style={{ fontWeight: 600 }}>{l.mezzo || "—"}</span>
               <span style={{ color: "#94a3b8" }}>{l.tipoEvento}</span>
               {l.luogo && <span style={{ color: "#64748b", fontSize: 13 }}>@ {l.luogo}</span>}
@@ -1226,8 +1246,8 @@ function Missioni({ missions, resources, onChange, openId, setOpenId, onAssignRe
       {missions.length === 0 && <div style={{ color: "#64748b", fontSize: 13, padding: 20, textAlign: "center" }}>Nessuna scheda missione. Aprine una da Attivazioni o Brogliaccio.</div>}
       {missions.map((m) => (
         <div key={m.id} onClick={() => setOpenId(m.id)} style={{ ...card, padding: "12px 14px", marginBottom: 8, cursor: "pointer", display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
-          <span style={{ fontFamily: "monospace", fontSize: 11, color: "#64748b", background: "#0f172a", padding: "2px 6px", borderRadius: 4 }}>N. {m.numero}</span>
-          <span style={{ fontFamily: "monospace", color: "#38bdf8", fontWeight: 700 }}>{m.ora}</span>
+          <span style={missionChip}>{m.numero}</span>
+          <span style={timeChip}>{m.ora}</span>
           <span style={{ fontWeight: 600 }}>{m.pazienti.length === 1 ? (m.pazienti[0].nome || m.pazienti[0].cognome ? `${m.pazienti[0].nome} ${m.pazienti[0].cognome}`.trim() : "Paziente non identificato") : `${m.pazienti.length} pazienti`}</span>
           {m.codiceInvio && <span style={{ fontSize: 11, color: "#64748b" }}>invio: <Badge bg={COLORI[m.codiceInvio].bg} color="#0b1220" text={COLORI[m.codiceInvio].label} /></span>}
           <span style={{ marginLeft: "auto", display: "flex", gap: 6 }}>
@@ -1463,7 +1483,10 @@ function SchedaMissione({ mission: m, resources, onUpdateMission, onUpdatePazien
     <div>
       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 14 }}>
         <button style={btnGhost} onClick={chiudi}><X size={14} /> Torna alle schede</button>
-        <div style={{ fontFamily: "monospace", fontSize: 13, color: "#38bdf8", fontWeight: 700 }}>Scheda missione N. {draft.numero}</div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span style={{ fontSize: 10, color: "#64748b", textTransform: "uppercase", letterSpacing: 1 }}>Scheda missione</span>
+          <span style={{ ...missionChip, fontSize: 18, padding: "4px 12px" }}>{draft.numero}</span>
+        </div>
         <button style={{ ...btnGhost, color: "#f87171" }} onClick={() => setConfirmDelete(true)}><Trash2 size={14} /> Elimina</button>
       </div>
 
