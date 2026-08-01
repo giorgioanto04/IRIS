@@ -93,7 +93,7 @@ const RESPIRO_OPZ = [["normale", "Normale"], ["difficoltoso", "Difficoltoso"], [
 const uid = () => Math.random().toString(36).slice(2, 10);
 const nowTime = () => new Date().toTimeString().slice(0, 5);
 
-// Unisce l'elenco eventi locale con quello letto dal Google Sheet: eventi presenti in uno solo dei
+// Unisce l'elenco eventi locale con quello letto dal Firebase: eventi presenti in uno solo dei
 // due elenchi vengono aggiunti, quelli presenti in entrambi restano una sola volta (per id).
 function mergeEvents_(local, remote) {
   const byId = new Map();
@@ -282,39 +282,74 @@ async function saveKey(key, value) {
   } catch (e) { console.error("storage error", e); }
 }
 
-// ================= Google Sheet (multi-dispositivo) =================
-// IRIS può appoggiarsi a un foglio Google, tramite un piccolo Google Apps Script pubblicato come
-// "app web" (vedi Impostazioni per le istruzioni). Si usa "text/plain" nel Content-Type per evitare
-// che il browser mandi una richiesta preflight CORS che Apps Script non gestisce.
+// Nome "cartella" leggibile per le missioni di un evento (equivalente del vecchio nome scheda
+// Firebases): niente caratteri non validi per una chiave Firebase.
+function sheetNameForEvent_(eventName) {
+  const base = String(eventName || "Evento").replace(/[.#$\[\]/\\?*:]/g, "-").trim() || "Evento";
+  return ("Missioni - " + base).slice(0, 100);
+}
+
+// ================= Firebase Realtime Database (multi-dispositivo) =================
+// IRIS si appoggia a un Firebase Realtime Database pubblico in scrittura/lettura (REST, niente SDK).
+// L'URL incollato dall'utente è il percorso completo con ".json" (es.
+// https://<progetto>-default-rtdb.<regione>.firebasedatabase.app/iris/dati.json): da lì ricaviamo la
+// "base" per costruire i percorsi delle singole chiavi. Ogni chiave viene salvata come nodo separato
+// { value, updated } così più chiavi possono essere scritte/lette senza sovrascriversi a vicenda, e il
+// campo "updated" permette al polling di capire se un dato è più recente di quello già mostrato.
+function firebaseBase_(url) {
+  return String(url || "").trim().replace(/\/?$/, "").replace(/\.json$/, "");
+}
+// Le chiavi di Firebase non possono contenere . # $ [ ] : le sostituiamo per sicurezza.
+function firebaseKey_(key) {
+  return String(key).replace(/[.#$\[\]]/g, "_");
+}
 async function sheetsPost(url, payload) {
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "text/plain;charset=utf-8" },
-    body: JSON.stringify(payload),
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
-  return data;
+  const base = firebaseBase_(url);
+  if (payload.action === "kv") {
+    const updated = Date.now();
+    const res = await fetch(`${base}/${firebaseKey_(payload.key)}.json`, {
+      method: "PUT",
+      body: JSON.stringify({ value: payload.value, updated }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return { ok: true, updated };
+  }
+  if (payload.action === "saveMission") {
+    const m = payload.mission;
+    const sheetKey = firebaseKey_(sheetNameForEvent_(payload.eventName));
+    const pazienti = (m.pazienti && m.pazienti.length) ? m.pazienti : [{}];
+    await Promise.all(pazienti.map((p, idx) => {
+      const chiave = firebaseKey_(`${m.numero}-${idx}`);
+      return fetch(`${base}/_missioni/${sheetKey}/${chiave}.json`, {
+        method: "PUT",
+        body: JSON.stringify({ ...p, numero: m.numero, ora: m.ora, luogo: m.luogo, motivo: m.motivo, codiceInvio: m.codiceInvio, mezzi: (m.risorse || []).map((r) => r.nome).join(", "), pazienteIndex: idx + 1, aggiornato: Date.now() }),
+      });
+    }));
+    return { ok: true };
+  }
+  throw new Error("Azione sconosciuta: " + payload.action);
 }
 async function sheetsGet(url, key) {
-  const res = await fetch(`${url}?key=${encodeURIComponent(key)}`, { method: "GET" });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok || data.error) throw new Error(data.error || `HTTP ${res.status}`);
-  return data.value != null ? data.value : null;
+  const base = firebaseBase_(url);
+  const res = await fetch(`${base}/${firebaseKey_(key)}.json`, { method: "GET" });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const data = await res.json().catch(() => null);
+  return data && data.value != null ? data.value : null;
 }
 async function sheetsGetMany(url, keys) {
-  const res = await fetch(`${url}?keys=${encodeURIComponent(keys.join(","))}`, { method: "GET" });
-  const data = await res.json().catch(() => ({}));
-  if (res.ok && !data.error && data.values) return { values: data.values, legacy: false };
-  const entries = [];
-  for (const key of keys) {
-    const legacyRes = await fetch(`${url}?key=${encodeURIComponent(key)}`, { method: "GET" });
-    const legacyData = await legacyRes.json().catch(() => ({}));
-    if (!legacyRes.ok || legacyData.error) throw new Error(legacyData.error || `HTTP ${legacyRes.status}`);
-    entries.push([key, { value: legacyData.value != null ? legacyData.value : null, updated: legacyData.updated || 0 }]);
-  }
-  return { values: Object.fromEntries(entries), legacy: true };
+  const base = firebaseBase_(url);
+  // Un'unica lettura dell'intero nodo (Firebase è pensato per questo) invece di una richiesta per chiave.
+  const res = await fetch(`${base}.json`, { method: "GET" });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  const data = (await res.json().catch(() => null)) || {};
+  const values = {};
+  keys.forEach((k) => {
+    const entry = data[firebaseKey_(k)];
+    values[k] = entry && entry.value != null ? { value: entry.value, updated: entry.updated || 0 } : { value: null, updated: 0 };
+  });
+  return { values, legacy: false };
 }
+
 
 // ================= Wizard attivazione =================
 const WIZARD_STEPS = [
@@ -450,7 +485,7 @@ function App() {
       try {
         const remoteEvents = await sheetsGet(url, "events");
         if (remoteEvents) finalEvents = mergeEvents_(localEvents, remoteEvents);
-      } catch (err) { console.error("Caricamento eventi da Google Sheet fallito:", err); }
+      } catch (err) { console.error("Caricamento eventi da Firebase fallito:", err); }
     }
     setEvents(finalEvents);
     await saveKey("events", finalEvents);
@@ -460,10 +495,10 @@ function App() {
   const persistTipiRisorsa = useCallback(async (next) => { setTipiRisorsa(next); await saveKey("tipiRisorsa", next); }, []);
   const persistSheetsUrl = useCallback(async (next) => { setSheetsUrl(next); await saveKey("sheetsUrl", next); }, []);
 
-  // Ricarica manualmente l'elenco eventi dal Google Sheet (pulsante nella schermata iniziale):
+  // Ricarica manualmente l'elenco eventi dal Firebase (pulsante nella schermata iniziale):
   // utile per far comparire sul tablet un evento appena creato sul PC (e viceversa).
   const loadEventsFromSheet = useCallback(async () => {
-    if (!sheetsUrl) { setSyncStatus("Nessun URL Google Sheet configurato (vedi Impostazioni)."); return; }
+    if (!sheetsUrl) { setSyncStatus("Nessun URL Firebase configurato (vedi Impostazioni)."); return; }
     setSyncStatus("Caricamento elenco eventi…");
     try {
       const remoteEvents = await sheetsGet(sheetsUrl, "events");
@@ -476,10 +511,10 @@ function App() {
     }
   }, [sheetsUrl, events]);
 
-  // Sincronizzazione manuale con Google Sheet: invia lo stato attuale (risorse, log, missioni)
+  // Sincronizzazione manuale con Firebase: invia lo stato attuale (risorse, log, missioni)
   // sia come "riga leggibile" (foglio dedicato all'evento) sia come copia grezza per il multi-dispositivo (foglio Storage).
   const syncToSheet = useCallback(async (mission) => {
-    if (!sheetsUrl) { setSyncStatus("Nessun URL Google Sheet configurato (vedi Impostazioni)."); return; }
+    if (!sheetsUrl) { setSyncStatus("Nessun URL Firebase configurato (vedi Impostazioni)."); return; }
     setSyncStatus("Salvataggio in corso…");
     try {
       const eventName = (events.find((e) => e.id === currentEventId) || {}).name || currentEventId;
@@ -487,16 +522,16 @@ function App() {
       await sheetsPost(sheetsUrl, { action: "kv", key: `log:${currentEventId}`, value: log });
       await sheetsPost(sheetsUrl, { action: "kv", key: `missions:${currentEventId}`, value: missions });
       if (mission) await sheetsPost(sheetsUrl, { action: "saveMission", mission, eventName });
-      setSyncStatus("Salvato su Google Sheet ✓ (" + nowTime() + ")");
+      setSyncStatus("Salvato su Firebase ✓ (" + nowTime() + ")");
     } catch (err) {
-      console.error("Errore sincronizzazione Google Sheet:", err);
+      console.error("Errore sincronizzazione Firebase:", err);
       setSyncStatus("Errore di sincronizzazione: controlla l'URL nelle Impostazioni.");
     }
   }, [sheetsUrl, currentEventId, resources, log, missions, events]);
 
   const loadFromSheet = useCallback(async () => {
-    if (!sheetsUrl) { setSyncStatus("Nessun URL Google Sheet configurato (vedi Impostazioni)."); return; }
-    setSyncStatus("Caricamento da Google Sheet…");
+    if (!sheetsUrl) { setSyncStatus("Nessun URL Firebase configurato (vedi Impostazioni)."); return; }
+    setSyncStatus("Caricamento da Firebase…");
     try {
       const r = await sheetsGet(sheetsUrl, `resources:${currentEventId}`);
       const l = await sheetsGet(sheetsUrl, `log:${currentEventId}`);
@@ -504,9 +539,9 @@ function App() {
       if (r) { setResources(r); await saveKey(`resources:${currentEventId}`, r); }
       if (l) { setLog(l); await saveKey(`log:${currentEventId}`, l); }
       if (m) { setMissions(m); await saveKey(`missions:${currentEventId}`, m); }
-      setSyncStatus("Dati aggiornati da Google Sheet ✓ (" + nowTime() + ")");
+      setSyncStatus("Dati aggiornati da Firebase ✓ (" + nowTime() + ")");
     } catch (err) {
-      console.error("Errore caricamento Google Sheet:", err);
+      console.error("Errore caricamento Firebase:", err);
       setSyncStatus("Errore nel caricamento: controlla l'URL nelle Impostazioni.");
     }
   }, [sheetsUrl, currentEventId]);
@@ -524,7 +559,7 @@ function App() {
   }, [currentEventId]);
 
   // Sincronizzazione automatica in background: ogni volta che qualcosa viene salvato localmente,
-  // se è configurato un Google Sheet lo si aggiorna subito anche lì, senza bisogno di premere un tasto.
+  // se è configurato un Firebase lo si aggiorna subito anche lì, senza bisogno di premere un tasto.
   // È "fire and forget": non blocca l'interfaccia e non impedisce il salvataggio locale se fallisce.
   const remoteTs = useRef({});
   const localSnapshot = useRef({});
@@ -549,9 +584,9 @@ function App() {
           const res = await sheetsPost(sheetsUrl, { action: "kv", key, value: nextValue });
           if (res && res.updated) remoteTs.current[key] = res.updated;
           setConnectionStatus("connected");
-          setSyncStatus("Sincronizzato con Google Sheet ✓ (" + nowTime() + ")");
+          setSyncStatus("Sincronizzato con Firebase ✓ (" + nowTime() + ")");
         } catch (err) {
-          console.error("Auto-sync Google Sheet:", err);
+          console.error("Auto-sync Firebase:", err);
           setConnectionStatus("error");
           setSyncStatus("Sincronizzazione automatica non riuscita: controlla l'URL in Impostazioni.");
         }
@@ -608,7 +643,7 @@ function App() {
           }
         }
       } catch (err) {
-        console.error("Polling Google Sheet:", err);
+        console.error("Polling Firebase:", err);
         if (!cancelled) setConnectionStatus("error");
       } finally {
         pollInFlight = false;
@@ -791,7 +826,7 @@ function TopBar({ currentEvent, tab, setTab, onNuovaSerata, inEvent, connectionS
         </div>
         {currentEvent && <div style={{ marginLeft: 14, paddingLeft: 14, borderLeft: "1px solid #1e293b", fontSize: 13, color: "#94a3b8" }}>{currentEvent.name} · {currentEvent.date}</div>}
       </div>
-      <div title={{ connected: "Google Sheet connesso", syncing: "Sincronizzazione in corso", error: "Google Sheet non raggiungibile", offline: "Google Sheet non configurato" }[connectionStatus]} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: "#94a3b8" }}>
+      <div title={{ connected: "Firebase connesso", syncing: "Sincronizzazione in corso", error: "Firebase non raggiungibile", offline: "Firebase non configurato" }[connectionStatus]} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11, color: "#94a3b8" }}>
         <span style={{ width: 9, height: 9, borderRadius: "50%", background: { connected: "#22c55e", syncing: "#eab308", error: "#ef4444", offline: "#64748b" }[connectionStatus], boxShadow: connectionStatus === "connected" ? "0 0 8px #22c55e" : "none" }} />
         {connectionStatus === "connected" ? "Connesso" : connectionStatus === "syncing" ? "Sincronizzazione…" : connectionStatus === "error" ? "Offline" : "Non configurato"}
       </div>
@@ -932,14 +967,14 @@ function EventoSetup({ events, onCreate, onSelect, onDelete, onLoadEventsFromShe
           <div style={{ fontWeight: 700 }}>Collegamento condiviso</div>
         </div>
         <div style={{ fontSize: 13, color: "#94a3b8", marginBottom: 10, lineHeight: 1.5 }}>
-          Incolla qui il link del foglio condiviso (lo stesso su tutti i dispositivi) per vedere subito
+          Incolla qui il link del database condiviso (lo stesso su tutti i dispositivi) per vedere subito
           gli eventi creati da chiunque altro. Senza questo collegamento, gli eventi restano visibili
           solo su questo dispositivo.
         </div>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
           <input
             style={{ ...input, flex: 1, minWidth: 220, boxSizing: "border-box" }}
-            placeholder="https://script.google.com/macros/s/AKfycb.../exec"
+            placeholder="https://tuo-progetto-default-rtdb.europe-west1.firebasedatabase.app/iris/dati.json"
             value={urlDraft}
             onChange={(e) => setUrlDraft(e.target.value)}
           />
@@ -1105,17 +1140,17 @@ function Impostazioni({ sheetsUrl, onChangeSheetsUrl, onSyncNow, onLoadNow, sync
   return (
     <div>
       <div style={card}>
-        <div style={{ fontWeight: 700, marginBottom: 8 }}>Google Sheet condiviso (multi-dispositivo)</div>
+        <div style={{ fontWeight: 700, marginBottom: 8 }}>Firebase condiviso (multi-dispositivo)</div>
         <div style={{ fontSize: 13, color: "#94a3b8", marginBottom: 12, lineHeight: 1.5 }}>
-          Incolla qui l'URL dell'"app web" di Google Apps Script collegata al tuo Google Sheet.
-          Una volta configurato, i tasti "Salva su Google Sheet" (nell'Attivazione e nella Scheda missione)
-          scrivono i dati sul foglio, così puoi lavorare da più computer o dal cellulare vedendo sempre
+          Incolla qui l'URL del tuo Firebase Realtime Database (il percorso completo con <code>.json</code> in fondo).
+          Una volta configurato, i tasti "Salva su Firebase" (nell'Attivazione e nella Scheda missione)
+          scrivono i dati sul database, così puoi lavorare da più computer o dal cellulare vedendo sempre
           la stessa situazione. Vedi in fondo a questa pagina le istruzioni passo passo per crearlo.
         </div>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
           <input
             style={{ ...input, flex: 1, minWidth: 260, boxSizing: "border-box" }}
-            placeholder="https://script.google.com/macros/s/AKfycb.../exec"
+            placeholder="https://tuo-progetto-default-rtdb.europe-west1.firebasedatabase.app/iris/dati.json"
             value={draft}
             onChange={(e) => setDraft(e.target.value)}
           />
@@ -1123,30 +1158,31 @@ function Impostazioni({ sheetsUrl, onChangeSheetsUrl, onSyncNow, onLoadNow, sync
         </div>
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
           <button style={btnSecondary} onClick={onSyncNow}><Download size={14} style={{ transform: "rotate(180deg)" }} /> Sincronizza ora (invia)</button>
-          <button style={btnSecondary} onClick={onLoadNow}><Download size={14} /> Carica dati dal foglio</button>
+          <button style={btnSecondary} onClick={onLoadNow}><Download size={14} /> Carica dati dal database</button>
         </div>
         {syncStatus && <div style={{ fontSize: 12, color: "#64748b", marginTop: 10 }}>{syncStatus}</div>}
       </div>
 
       <div style={{ ...card, marginTop: 16 }}>
-        <div style={{ fontWeight: 700, marginBottom: 8 }}>Come creare il foglio Google e collegarlo (una volta sola)</div>
+        <div style={{ fontWeight: 700, marginBottom: 8 }}>Come creare il database Firebase e collegarlo (una volta sola)</div>
         <ol style={{ fontSize: 13, color: "#cbd5e1", lineHeight: 1.8, paddingLeft: 20, margin: 0 }}>
-          <li>Vai su <b>sheets.google.com</b> e crea un nuovo foglio vuoto. Chiamalo ad es. "IRIS dati".</li>
-          <li>Nel foglio, in alto, apri <b>Estensioni → Apps Script</b>.</li>
-          <li>Cancella il contenuto di esempio e incolla il codice che trovi nel file <code>google-apps-script.gs</code>
-            (te lo fornisco insieme a questi file: apri IRIS con GitHub Pages/Claude, poi copia tutto il contenuto).</li>
-          <li>Clicca il dischetto per salvare, poi <b>Esegui</b> una volta (Apps Script ti chiederà l'autorizzazione:
-            accetta, è il tuo stesso foglio).</li>
-          <li>Clicca <b>Deploy → Nuova implementazione</b>, tipo "App web". Come "Chi ha accesso" scegli
-            <b> Chiunque</b> (serve per farla funzionare da qualunque computer/telefono senza login Google ripetuto).</li>
-          <li>Copia l'URL che termina con <code>/exec</code> e incollalo qui sopra, poi premi "Salva URL".</li>
+          <li>Vai su <b>console.firebase.google.com</b>, crea un progetto (o usane uno esistente).</li>
+          <li>Nel menu a sinistra apri <b>Build → Realtime Database</b> e clicca <b>Crea database</b>
+            (scegli una regione vicina, es. Europe-west1).</li>
+          <li>Nella scheda <b>Regole</b> imposta lettura e scrittura pubbliche in modo che tutti i dispositivi
+            possano leggere/scrivere senza login: <code>{"{ \"rules\": { \".read\": true, \".write\": true } }"}</code>
+            (comodo per un evento singolo/serata; ricordati che così chiunque conosca l'URL può leggere e
+            modificare i dati — non usarlo per dati sensibili a lungo termine).</li>
+          <li>Copia l'URL del database che vedi in alto nella pagina Realtime Database (finisce con
+            <code>.firebasedatabase.app</code>), aggiungi in fondo un percorso a piacere e <code>.json</code>,
+            ad es. <code>https://tuo-progetto-default-rtdb.europe-west1.firebasedatabase.app/iris/dati.json</code>,
+            e incollalo qui sopra, poi premi "Salva URL".</li>
           <li>Da questo momento tutto si sincronizza <b>in automatico</b> ad ogni azione (non serve più
-            premere alcun tasto): l'elenco eventi e i dati di ogni evento vengono scritti nella scheda
-            (tab) <b>Storage</b>, mentre per ogni evento/serata che crei viene generata in automatico
-            una scheda dedicata (es. <b>"Missioni - Concerto Piazza Duomo"</b>) con una riga leggibile
-            per ciascun paziente, comoda da stampare/filtrare/esportare. Nella schermata iniziale trovi
-            anche il tasto "Aggiorna da Google Sheet" per far comparire su un tablet gli eventi creati
-            nel frattempo da un altro computer.</li>
+            premere alcun tasto): l'elenco eventi e i dati di ogni evento vengono scritti come nodi del
+            database, mentre per ogni evento/serata che crei viene generata in automatico una sezione
+            dedicata (es. <b>"Missioni - Concerto Piazza Duomo"</b>) con una riga leggibile per ciascun
+            paziente. Nella schermata iniziale trovi anche il tasto "Aggiorna ora" per far comparire su
+            un tablet gli eventi creati nel frattempo da un altro computer.</li>
         </ol>
       </div>
     </div>
@@ -1177,7 +1213,7 @@ function Attivazioni({ log, missions, resources, onNuova, onApriScheda, onConclu
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14, flexWrap: "wrap", gap: 10 }}>
         <div style={{ fontSize: 13, color: "#94a3b8" }}>Avvia una nuova richiesta e assegna il codice colore d'invio.</div>
         <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-          <button style={btnSecondary} onClick={onSync} title={sheetsConfigured ? "" : "Configura l'URL in Impostazioni"}><Download size={14} style={{ transform: "rotate(180deg)" }} /> Salva su Google Sheet</button>
+          <button style={btnSecondary} onClick={onSync} title={sheetsConfigured ? "" : "Configura l'URL in Impostazioni"}><Download size={14} style={{ transform: "rotate(180deg)" }} /> Salva su Firebase</button>
           <button style={btnPrimary} onClick={onNuova}><Siren size={16} /> Nuova attivazione</button>
         </div>
       </div>
@@ -1328,7 +1364,7 @@ function Missioni({ missions, resources, log, onChange, openId, setOpenId, onAss
   return (
     <div>
       <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 10 }}>
-        <button style={btnSecondary} onClick={exportCsv}><Download size={14} /> Esporta CSV (Google Sheets)</button>
+        <button style={btnSecondary} onClick={exportCsv}><Download size={14} /> Esporta CSV (Firebases)</button>
       </div>
       {missions.length === 0 && <div style={{ color: "#64748b", fontSize: 13, padding: 20, textAlign: "center" }}>Nessuna scheda missione. Aprine una da Attivazioni o Brogliaccio.</div>}
       {missioniOrdinate.map((m) => {
@@ -1566,7 +1602,7 @@ function SchedaMissione({ mission: m, resources, onUpdateMission, onUpdatePazien
       </div>
 
       <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 14, flexWrap: "wrap" }}>
-        <button style={btnSecondary} onClick={onSync} title={sheetsConfigured ? "" : "Configura l'URL in Impostazioni"}><Download size={14} style={{ transform: "rotate(180deg)" }} /> Salva su Google Sheet</button>
+        <button style={btnSecondary} onClick={onSync} title={sheetsConfigured ? "" : "Configura l'URL in Impostazioni"}><Download size={14} style={{ transform: "rotate(180deg)" }} /> Salva su Firebase</button>
         {syncStatus && <span style={{ fontSize: 12, color: "#64748b" }}>{syncStatus}</span>}
       </div>
 
