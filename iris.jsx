@@ -780,7 +780,7 @@ function TopBar({ currentEvent, tab, setTab, onNuovaSerata, inEvent, connectionS
             </select>
             <ChevronDown size={14} style={{ position: "absolute", right: 9, top: 10, pointerEvents: "none", color: "#64748b" }} />
           </div>
-          <button onClick={onNuovaSerata} style={btnGhost}>Nuovo Evento</button>
+          <button onClick={onNuovaSerata} style={btnGhost}>Nuova serata</button>
         </div>
       )}
     </div>
@@ -904,7 +904,7 @@ function EventoSetup({ events, onCreate, onSelect, onDelete }) {
   };
   return (
     <div style={{ maxWidth: 640, margin: "40px auto", padding: "0 20px" }}>
-      <h1 style={{ fontSize: 22, fontWeight: 700, marginBottom: 4 }}>Nuovo Evento / evento</h1>
+      <h1 style={{ fontSize: 22, fontWeight: 700, marginBottom: 4 }}>Nuova serata / evento</h1>
       <p style={{ color: "#94a3b8", fontSize: 14, marginBottom: 24 }}>Crea lo "sheet" della serata: da qui si aprono risorse, attivazioni, brogliaccio e schede missione.</p>
       <div style={card}>
         <label style={label}>Nome evento</label>
