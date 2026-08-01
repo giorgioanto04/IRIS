@@ -22,28 +22,54 @@ const TIPI_POSTAZIONE = ["PMA", "Ospedale"]; // tipi che gestiscono un elenco di
 // progressione coerente blu → viola che segue il "viaggio" del mezzo, senza mai coincidere con i
 // colori di triage/invio, per evitare ambiguità visiva tra i due sistemi.
 const STATI_MEZZO = [
-  { id: "operativo", label: "Operativo", short: "OPER.", color: "#10b981", campo: null },
-  { id: "diretto_intervento", label: "Diretto intervento", short: "DIR. INT.", color: "#0ea5e9", campo: "oraPartenza" },
-  { id: "sul_intervento", label: "Sull'intervento", short: "S. INT.", color: "#6366f1", campo: "oraSulPosto" },
-  { id: "diretto_ospedale", label: "Diretto ospedale", short: "DIR. OSP.", color: "#8b5cf6", campo: "oraTrasporto" },
-  { id: "in_ospedale", label: "In ospedale", short: "OSPEDALE", color: "#a855f7", campo: "oraOspedale" },
-  { id: "libero_rientro", label: "Libero in rientro", short: "RIENTRO", color: "#14b8a6", campo: "oraRitorno" },
+  { id: "operativo", label: "Operativo", short: "OPER.", color: "#14b8a6", campo: null },
+  { id: "diretto_intervento", label: "Diretto intervento", short: "DIR. INT.", color: "#2563eb", campo: "oraPartenza" },
+  { id: "sul_intervento", label: "Sull'intervento", short: "S. INT.", color: "#7c3aed", campo: "oraSulPosto" },
+  { id: "diretto_ospedale", label: "Diretto ospedale", short: "DIR. OSP.", color: "#c026d3", campo: "oraTrasporto" },
+  { id: "in_ospedale", label: "In ospedale", short: "OSPEDALE", color: "#db2777", campo: "oraOspedale" },
+  { id: "libero_rientro", label: "Libero in rientro", short: "RIENTRO", color: "#64748b", campo: "oraRitorno" },
 ];
-const STATO_ALTRO = { id: "altro", label: "Altro", short: "ALTRO", color: "#64748b", campo: null };
+const STATO_ALTRO = { id: "altro", label: "Altro", short: "ALTRO", color: "#94a3b8", campo: null };
 
 // ================= Design tokens =================
-// Font monospazio "neutro" riservato SOLO ai numeri missione e agli orari: dà uniformità e li rende
-// riconoscibili a colpo d'occhio rispetto al resto del testo (che resta in Inter/sans-serif).
-const FONT_MONO = "'JetBrains Mono', ui-monospace, 'SF Mono', Consolas, monospace";
+// Font neutro (lo stesso sans-serif dell'app, non monospazio "da terminale") riservato ai numeri
+// missione e agli orari, con cifre tabulari per allineamento pulito: grande e in grassetto ma
+// coerente col resto della UI, non uno stile a parte.
+const FONT_NEUTRO = "'Inter', system-ui, -apple-system, sans-serif";
 const ACCENT = "#38bdf8"; // unico colore "operativo neutro" per elementi interattivi non semantici (bottoni, focus, link)
 // Chip del numero missione: grande, in grassetto, sempre riconoscibile allo stesso modo ovunque appaia.
 const missionChip = {
-  fontFamily: FONT_MONO, fontWeight: 800, fontSize: 15, letterSpacing: 0.5,
+  fontFamily: FONT_NEUTRO, fontVariantNumeric: "tabular-nums", fontWeight: 800, fontSize: 18, letterSpacing: 0.3,
   color: "#e2e8f0", background: "#0f172a", border: "1px solid #1e293b",
-  borderRadius: 6, padding: "3px 10px", whiteSpace: "nowrap",
+  borderRadius: 6, padding: "4px 12px", whiteSpace: "nowrap",
 };
-const missionChipSmall = { ...missionChip, fontSize: 12.5, padding: "2px 8px", fontWeight: 700 };
-const timeChip = { fontFamily: FONT_MONO, fontWeight: 700, fontSize: 13, color: ACCENT, whiteSpace: "nowrap" };
+const missionChipSmall = { ...missionChip, fontSize: 16, padding: "3px 10px", fontWeight: 800 };
+const timeChip = { fontFamily: FONT_NEUTRO, fontVariantNumeric: "tabular-nums", fontWeight: 700, fontSize: 14, color: ACCENT, whiteSpace: "nowrap" };
+
+// ================= Suono di conferma =================
+// Piccolo "bling" generato al volo (nessun file audio da caricare) suonato quando lo stato di un
+// mezzo viene cambiato, per dare un riscontro immediato anche senza guardare lo schermo.
+function playBling() {
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    const ctx = new Ctx();
+    const now = ctx.currentTime;
+    [1046.5, 1568].forEach((freq, i) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = "sine";
+      osc.frequency.value = freq;
+      const start = now + i * 0.07;
+      gain.gain.setValueAtTime(0, start);
+      gain.gain.linearRampToValueAtTime(0.18, start + 0.01);
+      gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.22);
+      osc.connect(gain); gain.connect(ctx.destination);
+      osc.start(start); osc.stop(start + 0.24);
+    });
+    setTimeout(() => ctx.close(), 500);
+  } catch { /* audio non disponibile: nessun problema, si prosegue senza suono */ }
+}
 
 // Trova, tra le missioni dell'evento, la più recente a cui la risorsa risulta assegnata (le missioni
 // sono ordinate dalla più recente): è quella su cui riportare gli orari quando cambia lo stato del mezzo.
@@ -610,6 +636,7 @@ export default function App() {
     const def = statoId === "altro" ? STATO_ALTRO : STATI_MEZZO.find((s) => s.id === statoId);
     if (!def) return;
     const statoLabel = statoId === "altro" ? (customLabel || "Altro") : def.label;
+    playBling();
 
     const nextResources = resources.map((x) => (x.id === resourceId ? { ...x, stato: statoId, statoLabel, statoOra: ora } : x));
     await persistResources(nextResources);
@@ -693,7 +720,7 @@ export default function App() {
     <div style={{ minHeight: "100vh", background: "#0b1220", color: "#e2e8f0", fontFamily: "'Inter', system-ui, sans-serif" }}>
       <style>{`
         .iris-body { display: flex; align-items: flex-start; max-width: 1400px; margin: 0 auto; }
-        .iris-sidebar { width: 240px; flex-shrink: 0; box-sizing: border-box; padding: 14px 10px; position: sticky; top: 62px; max-height: calc(100vh - 62px); overflow-y: auto; border-right: 1px solid #1e293b; }
+        .iris-sidebar { width: 300px; flex-shrink: 0; box-sizing: border-box; padding: 14px 12px; position: sticky; top: 62px; max-height: calc(100vh - 62px); overflow-y: auto; border-right: 1px solid #1e293b; }
         .iris-main { flex: 1; min-width: 0; box-sizing: border-box; padding: 16px 16px 60px; }
         @media (max-width: 860px) {
           .iris-body { flex-direction: column; }
@@ -753,7 +780,7 @@ function TopBar({ currentEvent, tab, setTab, onNuovaSerata, inEvent, connectionS
             </select>
             <ChevronDown size={14} style={{ position: "absolute", right: 9, top: 10, pointerEvents: "none", color: "#64748b" }} />
           </div>
-          <button onClick={onNuovaSerata} style={btnGhost}>Nuova serata</button>
+          <button onClick={onNuovaSerata} style={btnGhost}>Nuovo Evento</button>
         </div>
       )}
     </div>
@@ -761,6 +788,11 @@ function TopBar({ currentEvent, tab, setTab, onNuovaSerata, inEvent, connectionS
 }
 
 // ================= Barra laterale stato risorse =================
+function hexToRgba(hex, alpha) {
+  const h = hex.replace("#", "");
+  const r = parseInt(h.substring(0, 2), 16), g = parseInt(h.substring(2, 4), 16), b = parseInt(h.substring(4, 6), 16);
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
 const TIPO_ICON = { Ambulanza: Ambulance, Radio: Radio, Personale: Users };
 const sidebarTitle = { fontSize: 11, textTransform: "uppercase", letterSpacing: 1, color: "#64748b", marginBottom: 10, padding: "0 4px", fontWeight: 700 };
 
@@ -811,13 +843,15 @@ function ResourceStatusCard({ resource, missions, onSetStato }) {
   const timbra = () => onSetStato(current, current === "altro" ? (resource.statoLabel || "Altro") : undefined);
 
   return (
-    <div style={{ background: "#111827", border: "1px solid #1e293b", borderRadius: 8, padding: "10px 12px", marginBottom: 8 }}>
-      <div style={{ display: "flex", alignItems: "center", gap: 7, marginBottom: 4 }}>
-        <Icon size={13} color="#64748b" style={{ flexShrink: 0 }} />
-        <span style={{ fontWeight: 700, fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>{resource.nome}</span>
-        <span className={current === "operativo" ? "" : "iris-dot-blink"} style={{ width: 8, height: 8, borderRadius: "50%", background: def.color, flexShrink: 0, boxShadow: `0 0 6px ${def.color}` }} />
+    <div style={{ background: hexToRgba(def.color, 0.09), border: "1px solid #1e293b", borderLeft: `5px solid ${def.color}`, borderRadius: 8, padding: "12px 14px", marginBottom: 10 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
+        <Icon size={15} color="#94a3b8" style={{ flexShrink: 0 }} />
+        <span style={{ fontWeight: 800, fontSize: 15, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", flex: 1 }}>{resource.nome}</span>
+        <span className={current === "operativo" ? "" : "iris-dot-blink"} style={{ width: 9, height: 9, borderRadius: "50%", background: def.color, flexShrink: 0, boxShadow: `0 0 6px ${def.color}` }} />
       </div>
-      {missioneAttiva && (
+      {/* Una volta tornato "Operativo" il mezzo è di nuovo libero: non ha senso mostrarlo ancora
+          agganciato all'ultima missione, quindi il riferimento sparisce. */}
+      {missioneAttiva && current !== "operativo" && (
         <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 8 }}>
           <span style={{ fontSize: 9.5, color: "#64748b", textTransform: "uppercase", letterSpacing: 0.5 }}>Missione</span>
           <span style={missionChipSmall}>{missioneAttiva.numero}</span>
@@ -829,19 +863,19 @@ function ResourceStatusCard({ resource, missions, onSetStato }) {
           <select
             value={current === "altro" ? "altro" : current}
             onChange={handleSelect}
-            style={{ ...input, width: "100%", boxSizing: "border-box", appearance: "none", fontSize: 12, fontWeight: 700, color: def.color, borderColor: def.color, paddingRight: 26, cursor: "pointer" }}
+            style={{ ...input, width: "100%", boxSizing: "border-box", appearance: "none", fontSize: 13, fontWeight: 700, color: def.color, borderColor: def.color, background: "#0f172a", paddingRight: 26, paddingTop: 8, paddingBottom: 8, cursor: "pointer" }}
           >
             {STATI_MEZZO.map((s) => <option key={s.id} value={s.id}>{s.label}</option>)}
             <option value="altro">Altro…</option>
           </select>
-          <ChevronDown size={13} style={{ position: "absolute", right: 8, top: 9, pointerEvents: "none", color: def.color }} />
+          <ChevronDown size={14} style={{ position: "absolute", right: 8, top: 11, pointerEvents: "none", color: def.color }} />
         </div>
-        <button title="Registra ora l'orario per lo stato corrente" onClick={timbra} style={{ ...btnGhost, padding: "6px 7px", border: "1px solid #1e293b", flexShrink: 0 }}>
-          <Clock size={13} />
+        <button title="Registra ora l'orario per lo stato corrente" onClick={timbra} style={{ ...btnGhost, padding: "7px 8px", border: "1px solid #1e293b", background: "#0f172a", flexShrink: 0 }}>
+          <Clock size={14} />
         </button>
       </div>
 
-      <div style={{ fontSize: 10.5, color: "#64748b", marginTop: 6 }}>{badgeLabel}{resource.statoOra ? ` · aggiornato ${resource.statoOra}` : ""}</div>
+      <div style={{ fontSize: 11.5, color: "#94a3b8", marginTop: 8, fontWeight: 600 }}>{badgeLabel}{resource.statoOra ? <span style={{ color: "#64748b", fontWeight: 400 }}> · aggiornato {resource.statoOra}</span> : ""}</div>
 
       {customOpen && (
         <div style={{ display: "flex", gap: 4, marginTop: 8 }}>
@@ -870,7 +904,7 @@ function EventoSetup({ events, onCreate, onSelect, onDelete }) {
   };
   return (
     <div style={{ maxWidth: 640, margin: "40px auto", padding: "0 20px" }}>
-      <h1 style={{ fontSize: 22, fontWeight: 700, marginBottom: 4 }}>Nuova serata / evento</h1>
+      <h1 style={{ fontSize: 22, fontWeight: 700, marginBottom: 4 }}>Nuovo Evento / evento</h1>
       <p style={{ color: "#94a3b8", fontSize: 14, marginBottom: 24 }}>Crea lo "sheet" della serata: da qui si aprono risorse, attivazioni, brogliaccio e schede missione.</p>
       <div style={card}>
         <label style={label}>Nome evento</label>
@@ -1181,7 +1215,7 @@ function Brogliaccio({ log, onChange, resources, missions, onApriScheda }) {
           <div key={l.id} style={{ ...card, padding: "12px 14px", marginBottom: 8 }}>
             <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
               {l.numero && <span style={missionChip}>{l.numero}</span>}
-              <input type="time" value={l.ora} onChange={(e) => setOra(l.id, e.target.value)} style={{ ...input, width: 90, fontFamily: FONT_MONO, color: ACCENT, fontWeight: 700 }} />
+              <input type="time" value={l.ora} onChange={(e) => setOra(l.id, e.target.value)} style={{ ...input, width: 90, fontFamily: FONT_NEUTRO, fontVariantNumeric: "tabular-nums", color: ACCENT, fontWeight: 700 }} />
               <span style={{ fontWeight: 600 }}>{l.mezzo || "—"}</span>
               <span style={{ color: "#94a3b8" }}>{l.tipoEvento}</span>
               {l.luogo && <span style={{ color: "#64748b", fontSize: 13 }}>@ {l.luogo}</span>}
@@ -1189,7 +1223,7 @@ function Brogliaccio({ log, onChange, resources, missions, onApriScheda }) {
               <span style={{ marginLeft: "auto", fontSize: 11, fontWeight: 700, padding: "2px 8px", borderRadius: 20, background: l.stato === "conclusa" ? "#14532d" : "#78350f", color: l.stato === "conclusa" ? "#86efac" : "#fcd34d" }}>{l.stato.toUpperCase()}</span>
             </div>
             {l.note && <div style={{ fontSize: 12, color: "#64748b", marginTop: 4 }}>{l.note}</div>}
-            <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+            <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 8 }}>
               <button
                 style={{ ...btnSecondary, ...(pronta ? {} : { opacity: 0.4, cursor: "not-allowed", borderColor: "#334155", color: "#64748b" }) }}
                 disabled={!pronta}
@@ -1199,7 +1233,7 @@ function Brogliaccio({ log, onChange, resources, missions, onApriScheda }) {
                 {l.missionId ? "Apri scheda missione" : "+ Apri scheda missione"}
               </button>
               {l.stato !== "conclusa" && <button style={btnGhost} onClick={() => chiudi(l.id)}>Chiudi</button>}
-              <button style={{ ...btnGhost, color: "#f87171" }} onClick={() => remove(l.id)}><Trash2 size={13} /></button>
+              <button style={{ ...btnGhost, color: "#f87171", flexShrink: 0 }} onClick={() => remove(l.id)}><Trash2 size={13} /></button>
             </div>
           </div>
           );
